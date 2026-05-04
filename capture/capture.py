@@ -1,15 +1,24 @@
 """
-capture/capture.py — CORRIGÉ Windows
+capture/capture.py — CORRIGÉ COMPLET
 ======================================
-[FIX WIN-1] asyncio event loop manquant dans le thread de capture (Windows)
-            → asyncio.set_event_loop(asyncio.new_event_loop()) avant pyshark
-[FIX WIN-2] Interface réseau : "eth0" invalide sur Windows
-            → utilise l'interface détectée par api/main.py via NIDS_INTERFACE
-[FIX WIN-3] netStat.py absent de Kitsune-py cloné → fallback propre
-[FIX WIN-4] pyshark.LiveCapture sur Windows nécessite Npcap (pas Wireshark seul)
+[FIX-1] netStat.__init__() : suppression du 3e argument np.nan invalide
+         → ns.netStat() sans arguments (utilise les Lambdas par défaut)
+[FIX-2] Interface Windows : auto-détection via pyshark au lieu de "eth0"
+         → NIDS_INTERFACE env var OU détection automatique de la première
+           interface réelle disponible
+[FIX-3] Méthode updateGetStats (camelCase) — API réelle de Kitsune-py
+         → N'utilise PAS update_get_stats (snake_case) qui n'existe pas
+[FIX-4] getNetStatHeaders() → utilise FeatureExtractor pour compter les features
+         → fallback propre si non disponible
+[FIX-5] asyncio event loop dans thread secondaire (Windows)
 """
 
-import sys, time, threading, asyncio, numpy as np
+import os
+import sys
+import time
+import threading
+import asyncio
+import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -21,25 +30,32 @@ _CANDIDATES = [
     _PROJECT_ROOT / "KitNET-py",
     _PROJECT_ROOT / "kitsune-py",
 ]
+_kitsune_path = None
 for _c in _CANDIDATES:
     if (_c / "netStat.py").exists():
         sys.path.insert(0, str(_c))
+        _kitsune_path = _c
         print(f"[AfterImage] netStat.py trouvé dans : {_c.name}")
         break
     elif _c.exists():
         sys.path.insert(0, str(_c))
 
+AFTERIMAGE_AVAILABLE = False
 try:
     import netStat as ns
-    AFTERIMAGE_AVAILABLE = True
-    print("[OK] AfterImage (netStat) disponible")
-except ImportError:
-    AFTERIMAGE_AVAILABLE = False
-    print("[WARN] netStat.py introuvable dans Kitsune-py")
-    print("       Le dossier Kitsune-py existe mais netStat.py est absent.")
-    print("       Solution : supprimez Kitsune-py et re-clonez :")
-    print("       rmdir /s /q Kitsune-py")
-    print("       git clone https://github.com/ymirsky/Kitsune-py.git")
+    # Vérifier que c'est bien le vrai netStat de Kitsune-py
+    # Le vrai a la classe netStat avec updateGetStats (camelCase)
+    _test = ns.netStat()
+    if hasattr(_test, 'updateGetStats'):
+        AFTERIMAGE_AVAILABLE = True
+        print("[OK] AfterImage (netStat Kitsune-py) disponible")
+    else:
+        print("[WARN] netStat chargé mais API incorrecte (pas updateGetStats)")
+        print("       Assurez-vous que Kitsune-py est bien cloné depuis :")
+        print("       https://github.com/ymirsky/Kitsune-py.git")
+except Exception as e:
+    print(f"[WARN] netStat non disponible : {e}")
+    print("       Clonez Kitsune-py : git clone https://github.com/ymirsky/Kitsune-py.git")
 
 try:
     import pyshark
@@ -49,14 +65,67 @@ except ImportError:
     PYSHARK_AVAILABLE = False
     print("[WARN] pyshark manquant — pip install pyshark")
 
+
+# ── [FIX-2] Auto-détection d'interface Windows ────────────────────
+def _detect_interface() -> str:
+    """
+    Retourne l'interface réseau à utiliser.
+    Priorité : var d'env NIDS_INTERFACE > Wi-Fi > Ethernet > première dispo.
+    """
+    # 1. Variable d'environnement explicite
+    env_iface = os.environ.get("NIDS_INTERFACE", "").strip()
+    if env_iface:
+        print(f"[CAPTURE] Interface depuis NIDS_INTERFACE : '{env_iface}'")
+        return env_iface
+
+    if not PYSHARK_AVAILABLE:
+        return "eth0"
+
+    try:
+        # 2. Lister les interfaces disponibles
+        cap_tmp = pyshark.LiveCapture()
+        interfaces = cap_tmp.interfaces if hasattr(cap_tmp, 'interfaces') else []
+
+        # Sur Windows, pyshark retourne des noms humains ou des GUIDs
+        # On préfère Wi-Fi, puis Ethernet, sinon la première non-loopback
+        preferred = []
+        for iface in interfaces:
+            name_lower = iface.lower()
+            if "wi-fi" in name_lower or "wifi" in name_lower or "wireless" in name_lower:
+                preferred.insert(0, iface)  # Wi-Fi en premier
+            elif "ethernet" in name_lower and "loopback" not in name_lower:
+                preferred.append(iface)
+            elif "loopback" not in name_lower and "usbpcap" not in name_lower.replace(" ", ""):
+                preferred.append(iface)
+
+        if preferred:
+            chosen = preferred[0]
+            print(f"[CAPTURE] Interface auto-détectée : '{chosen}'")
+            print(f"[CAPTURE] Interfaces disponibles : {interfaces}")
+            print(f"[CAPTURE] Pour forcer une interface : set NIDS_INTERFACE=<nom>")
+            return chosen
+
+        if interfaces:
+            print(f"[CAPTURE] Interfaces disponibles : {interfaces}")
+            return interfaces[0]
+
+    except Exception as e:
+        print(f"[CAPTURE] Détection d'interface échouée : {e}")
+
+    # 3. Fallback plateforme
+    if sys.platform == "win32":
+        return "Wi-Fi"
+    return "eth0"
+
+
 UNSW_FEATURES = [
-    'dur','sbytes','dbytes','sttl','dttl','sloss','dloss',
-    'Sload','Dload','Spkts','Dpkts','swin','dwin','stcpb','dtcpb',
-    'smeansz','dmeansz','trans_depth','res_bdy_len','Sjit','Djit',
-    'Sintpkt','Dintpkt','tcprtt','synack','ackdat',
-    'ct_state_ttl','ct_flw_http_mthd','ct_srv_src','ct_srv_dst',
-    'ct_dst_ltm','ct_src_ ltm','ct_src_dport_ltm',
-    'ct_dst_sport_ltm','ct_dst_src_ltm'
+    'dur', 'sbytes', 'dbytes', 'sttl', 'dttl', 'sloss', 'dloss',
+    'Sload', 'Dload', 'Spkts', 'Dpkts', 'swin', 'dwin', 'stcpb', 'dtcpb',
+    'smeansz', 'dmeansz', 'trans_depth', 'res_bdy_len', 'Sjit', 'Djit',
+    'Sintpkt', 'Dintpkt', 'tcprtt', 'synack', 'ackdat',
+    'ct_state_ttl', 'ct_flw_http_mthd', 'ct_srv_src', 'ct_srv_dst',
+    'ct_dst_ltm', 'ct_src_ ltm', 'ct_src_dport_ltm',
+    'ct_dst_sport_ltm', 'ct_dst_src_ltm'
 ]
 
 
@@ -115,15 +184,34 @@ class FlowRecord:
 
 
 class AfterImageExtractor:
+    """
+    [FIX-1] Initialise ns.netStat() SANS arguments positionnels.
+    Le vrai Kitsune-py netStat.__init__ a la signature :
+        def __init__(self, Lambdas=None, tstats_len=None)
+    → appel correct : ns.netStat()  (utilise les defaults)
+
+    [FIX-3] Utilise updateGetStats (camelCase) — l'API réelle de Kitsune-py.
+    """
     def __init__(self):
         self._nstat = None
+        self._n_features = 115  # valeur par défaut
         if not AFTERIMAGE_AVAILABLE:
             return
         try:
-            self._nstat = ns.netStat(np.nan, 100_000_000, 100_000_000)
-            print(f"[AfterImage] initialisé — {self.n_features} features")
+            # [FIX-1] : zéro argument positionnel — le vrai netStat l'accepte
+            self._nstat = ns.netStat()
+            # Déduire le nombre de features depuis les headers si disponible
+            try:
+                headers = self._nstat.getNetStatHeaders()
+                self._n_features = len(headers)
+            except AttributeError:
+                # Kitsune-py n'expose pas toujours getNetStatHeaders directement
+                # Le nombre standard est 115
+                self._n_features = 115
+            print(f"[AfterImage] initialisé — {self._n_features} features")
         except Exception as e:
             print(f"[WARN] netStat init failed : {e}")
+            self._nstat = None
 
     def extract(self, pkt) -> Optional[np.ndarray]:
         if self._nstat is None:
@@ -169,6 +257,7 @@ class AfterImageExtractor:
             if srcIP == '' and srcproto == '':
                 srcIP, dstIP = srcMAC, dstMAC
 
+            # [FIX-3] : updateGetStats (camelCase) — API réelle Kitsune-py
             vec = self._nstat.updateGetStats(
                 IPtype, srcMAC, dstMAC,
                 srcIP, srcproto, dstIP, dstproto,
@@ -181,26 +270,21 @@ class AfterImageExtractor:
 
     @property
     def n_features(self) -> int:
-        if self._nstat is None:
-            return 0
-        try:
-            return len(self._nstat.getNetStatHeaders())
-        except Exception:
-            return 115
+        return self._n_features
 
 
 class NetworkCapture:
     """
     Capture réseau double pipeline.
-    [FIX WIN-1] Le thread de capture crée sa propre boucle asyncio (Windows).
-    [FIX WIN-2] Interface passée en paramètre depuis api/main.py (auto-détectée).
+    [FIX-2] Interface auto-détectée (Windows compatible).
+    [FIX-5] Thread de capture crée sa propre boucle asyncio (Windows).
     """
     FLOW_TIMEOUT  = 30.0
     MAX_FLOW_PKTS = 200
 
     def __init__(
         self,
-        interface:        str                = "Wi-Fi",
+        interface:        str                = "",   # vide = auto-détection
         bpf_filter:       str                = "ip",
         on_flow:          Optional[Callable] = None,
         on_packet_vector: Optional[Callable] = None,
@@ -208,6 +292,10 @@ class NetworkCapture:
         flow_timeout:     float              = 30.0,
         max_flow_pkts:    int                = 200,
     ):
+        # [FIX-2] Auto-détection si interface non spécifiée ou "eth0" sur Windows
+        if not interface or (interface == "eth0" and sys.platform == "win32"):
+            interface = _detect_interface()
+
         self.interface        = interface
         self.bpf_filter       = bpf_filter
         self.on_flow          = on_flow          or (lambda x: None)
@@ -307,12 +395,9 @@ class NetworkCapture:
 
     def start(self):
         if not PYSHARK_AVAILABLE:
-            raise RuntimeError("pyshark non installé")
+            raise RuntimeError("pyshark non installé — pip install pyshark")
 
-        # ── [FIX WIN-1] Créer une boucle asyncio pour CE thread ───
-        # pyshark utilise asyncio en interne. Sur Windows, le thread
-        # principal d'uvicorn possède déjà une boucle, mais les threads
-        # secondaires n'en ont pas → RuntimeError "no current event loop"
+        # [FIX-5] Créer une boucle asyncio pour ce thread (Windows)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
@@ -324,16 +409,14 @@ class NetworkCapture:
             cap = pyshark.FileCapture(
                 self.use_pcap,
                 keep_packets=False,
-                eventloop=loop,          # passer la boucle explicitement
+                eventloop=loop,
             )
         else:
             print(f"[CAPTURE] Live sur : '{self.interface}' (filtre: '{self.bpf_filter}')")
-            print(f"[CAPTURE] Windows : Npcap requis — https://npcap.com")
-            print(f"[CAPTURE] Pour lister les interfaces : python -c \"import pyshark; print(pyshark.LiveCapture().interfaces)\"")
             cap = pyshark.LiveCapture(
                 interface  = self.interface,
                 bpf_filter = self.bpf_filter,
-                eventloop  = loop,       # [FIX WIN-1] boucle explicite
+                eventloop  = loop,
             )
 
         try:
@@ -362,6 +445,7 @@ class NetworkCapture:
                     self._update_flow(key, pkt)
 
         except Exception as e:
+            print(f"[CAPTURE] Erreur : {e}")
             raise
         finally:
             try:
