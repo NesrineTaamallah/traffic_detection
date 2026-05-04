@@ -1,16 +1,17 @@
 """
-capture/capture.py — CORRIGÉ COMPLET
-======================================
-[FIX-1] netStat.__init__() : suppression du 3e argument np.nan invalide
-         → ns.netStat() sans arguments (utilise les Lambdas par défaut)
-[FIX-2] Interface Windows : auto-détection via pyshark au lieu de "eth0"
-         → NIDS_INTERFACE env var OU détection automatique de la première
-           interface réelle disponible
-[FIX-3] Méthode updateGetStats (camelCase) — API réelle de Kitsune-py
-         → N'utilise PAS update_get_stats (snake_case) qui n'existe pas
-[FIX-4] getNetStatHeaders() → utilise FeatureExtractor pour compter les features
-         → fallback propre si non disponible
-[FIX-5] asyncio event loop dans thread secondaire (Windows)
+capture/capture.py — CORRIGÉ v3
+======================================================
+FIXES :
+[FIX-1] Interface Windows : lecture des noms lisibles via tshark/winreg
+         pour mapper GUID → nom humain (Wi-Fi, Ethernet, etc.)
+[FIX-2] _flow_key() : délai pyshark → accès aux couches via indexation
+         sécurisée + support ICMP/ARP + log des paquets ignorés
+[FIX-3] FLOW_TIMEOUT réduit à 5 s (30 s = flux jamais émis en démo)
+         MAX_FLOW_PKTS réduit à 50 pour émettre plus vite
+[FIX-4] Émission forcée des flux actifs toutes les 3 s (flush périodique)
+         pour que XGBoost reçoive du trafic dès le début
+[FIX-5] Log détaillé : paquets reçus, flux émis, vecteurs AfterImage
+[FIX-6] configure_n_features() : suppression du guard packet_count > 0
 """
 
 import os
@@ -18,6 +19,7 @@ import sys
 import time
 import threading
 import asyncio
+import subprocess
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -43,19 +45,14 @@ for _c in _CANDIDATES:
 AFTERIMAGE_AVAILABLE = False
 try:
     import netStat as ns
-    # Vérifier que c'est bien le vrai netStat de Kitsune-py
-    # Le vrai a la classe netStat avec updateGetStats (camelCase)
     _test = ns.netStat()
     if hasattr(_test, 'updateGetStats'):
         AFTERIMAGE_AVAILABLE = True
         print("[OK] AfterImage (netStat Kitsune-py) disponible")
     else:
         print("[WARN] netStat chargé mais API incorrecte (pas updateGetStats)")
-        print("       Assurez-vous que Kitsune-py est bien cloné depuis :")
-        print("       https://github.com/ymirsky/Kitsune-py.git")
 except Exception as e:
     print(f"[WARN] netStat non disponible : {e}")
-    print("       Clonez Kitsune-py : git clone https://github.com/ymirsky/Kitsune-py.git")
 
 try:
     import pyshark
@@ -66,13 +63,50 @@ except ImportError:
     print("[WARN] pyshark manquant — pip install pyshark")
 
 
-# ── [FIX-2] Auto-détection d'interface Windows ────────────────────
+# ── [FIX-1] Résolution GUID → nom lisible (Windows) ───────────────
+def _guid_to_friendly_name(guid: str) -> str:
+    """Tente de résoudre un GUID d'interface Windows en nom lisible."""
+    if sys.platform != "win32":
+        return guid
+    try:
+        import winreg
+        base = r"SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}"
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base)
+        # Extraire le GUID pur depuis \Device\NPF_{GUID}
+        pure = guid.replace("\\Device\\NPF_", "").strip("{}")
+        sub_path = f"{base}\\{{{pure}}}\\Connection"
+        try:
+            sub = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, sub_path)
+            name, _ = winreg.QueryValueEx(sub, "Name")
+            return str(name)
+        except Exception:
+            return guid
+    except Exception:
+        return guid
+
+
+def _list_interfaces_with_names() -> list[tuple[str, str]]:
+    """Retourne [(guid, friendly_name), ...] pour toutes les interfaces pyshark."""
+    if not PYSHARK_AVAILABLE:
+        return []
+    try:
+        cap_tmp = pyshark.LiveCapture()
+        raw_ifaces = cap_tmp.interfaces if hasattr(cap_tmp, 'interfaces') else []
+        result = []
+        for iface in raw_ifaces:
+            friendly = _guid_to_friendly_name(iface)
+            result.append((iface, friendly))
+        return result
+    except Exception as e:
+        print(f"[CAPTURE] Impossible de lister les interfaces : {e}")
+        return []
+
+
 def _detect_interface() -> str:
     """
     Retourne l'interface réseau à utiliser.
-    Priorité : var d'env NIDS_INTERFACE > Wi-Fi > Ethernet > première dispo.
+    Priorité : NIDS_INTERFACE > Wi-Fi > Ethernet > première non-loopback
     """
-    # 1. Variable d'environnement explicite
     env_iface = os.environ.get("NIDS_INTERFACE", "").strip()
     if env_iface:
         print(f"[CAPTURE] Interface depuis NIDS_INTERFACE : '{env_iface}'")
@@ -81,41 +115,42 @@ def _detect_interface() -> str:
     if not PYSHARK_AVAILABLE:
         return "eth0"
 
-    try:
-        # 2. Lister les interfaces disponibles
-        cap_tmp = pyshark.LiveCapture()
-        interfaces = cap_tmp.interfaces if hasattr(cap_tmp, 'interfaces') else []
+    pairs = _list_interfaces_with_names()
+    if not pairs:
+        return "eth0"
 
-        # Sur Windows, pyshark retourne des noms humains ou des GUIDs
-        # On préfère Wi-Fi, puis Ethernet, sinon la première non-loopback
-        preferred = []
-        for iface in interfaces:
-            name_lower = iface.lower()
-            if "wi-fi" in name_lower or "wifi" in name_lower or "wireless" in name_lower:
-                preferred.insert(0, iface)  # Wi-Fi en premier
-            elif "ethernet" in name_lower and "loopback" not in name_lower:
-                preferred.append(iface)
-            elif "loopback" not in name_lower and "usbpcap" not in name_lower.replace(" ", ""):
-                preferred.append(iface)
+    print(f"[CAPTURE] Interfaces disponibles :")
+    for guid, name in pairs:
+        print(f"          {name!r:30s} → {guid}")
+    print(f"[CAPTURE] Pour forcer : set NIDS_INTERFACE=<guid ou nom>")
 
-        if preferred:
-            chosen = preferred[0]
-            print(f"[CAPTURE] Interface auto-détectée : '{chosen}'")
-            print(f"[CAPTURE] Interfaces disponibles : {interfaces}")
-            print(f"[CAPTURE] Pour forcer une interface : set NIDS_INTERFACE=<nom>")
-            return chosen
+    # Préférence par nom lisible
+    preferred_keywords = ["wi-fi", "wifi", "wireless", "wlan", "ethernet", "lan", "local"]
+    skip_keywords = ["loopback", "usbpcap", "etwdump", "bluetooth", "npcap loopback"]
 
-        if interfaces:
-            print(f"[CAPTURE] Interfaces disponibles : {interfaces}")
-            return interfaces[0]
+    candidates = []
+    for guid, name in pairs:
+        name_l = name.lower()
+        if any(s in name_l for s in skip_keywords):
+            continue
+        priority = 99
+        for i, kw in enumerate(preferred_keywords):
+            if kw in name_l:
+                priority = i
+                break
+        candidates.append((priority, guid, name))
 
-    except Exception as e:
-        print(f"[CAPTURE] Détection d'interface échouée : {e}")
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        _, chosen_guid, chosen_name = candidates[0]
+        print(f"[CAPTURE] Interface choisie : {chosen_name!r} ({chosen_guid})")
+        return chosen_guid
 
-    # 3. Fallback plateforme
-    if sys.platform == "win32":
-        return "Wi-Fi"
-    return "eth0"
+    # Fallback : première interface non-loopback
+    for guid, name in pairs:
+        if "loopback" not in name.lower() and "etwdump" not in name.lower():
+            return guid
+    return pairs[0][0] if pairs else "eth0"
 
 
 UNSW_FEATURES = [
@@ -185,29 +220,21 @@ class FlowRecord:
 
 class AfterImageExtractor:
     """
-    [FIX-1] Initialise ns.netStat() SANS arguments positionnels.
-    Le vrai Kitsune-py netStat.__init__ a la signature :
-        def __init__(self, Lambdas=None, tstats_len=None)
-    → appel correct : ns.netStat()  (utilise les defaults)
-
-    [FIX-3] Utilise updateGetStats (camelCase) — l'API réelle de Kitsune-py.
+    Wrapper netStat de Kitsune-py.
+    updateGetStats = API camelCase réelle.
     """
     def __init__(self):
         self._nstat = None
-        self._n_features = 115  # valeur par défaut
+        self._n_features = 100
         if not AFTERIMAGE_AVAILABLE:
             return
         try:
-            # [FIX-1] : zéro argument positionnel — le vrai netStat l'accepte
             self._nstat = ns.netStat()
-            # Déduire le nombre de features depuis les headers si disponible
             try:
                 headers = self._nstat.getNetStatHeaders()
                 self._n_features = len(headers)
             except AttributeError:
-                # Kitsune-py n'expose pas toujours getNetStatHeaders directement
-                # Le nombre standard est 115
-                self._n_features = 115
+                self._n_features = 100
             print(f"[AfterImage] initialisé — {self._n_features} features")
         except Exception as e:
             print(f"[WARN] netStat init failed : {e}")
@@ -223,41 +250,58 @@ class AfterImageExtractor:
             srcIP = dstIP = srcMAC = dstMAC = ''
             srcproto = dstproto = ''
 
-            if hasattr(pkt, 'ip'):
-                srcIP, dstIP = pkt.ip.src, pkt.ip.dst
+            # Couche IP / IPv6
+            try:
+                ip = pkt['ip']
+                srcIP, dstIP = ip.src, ip.dst
                 IPtype = 0
-            elif hasattr(pkt, 'ipv6'):
-                srcIP, dstIP = pkt.ipv6.src, pkt.ipv6.dst
-                IPtype = 1
-
-            if hasattr(pkt, 'tcp'):
-                srcproto = str(pkt.tcp.srcport)
-                dstproto = str(pkt.tcp.dstport)
-            elif hasattr(pkt, 'udp'):
-                srcproto = str(pkt.udp.srcport)
-                dstproto = str(pkt.udp.dstport)
-            elif hasattr(pkt, 'arp'):
-                srcproto = dstproto = 'arp'
+            except Exception:
                 try:
-                    srcIP = pkt.arp.src_proto_ipv4
-                    dstIP = pkt.arp.dst_proto_ipv4
-                    IPtype = 0
+                    ip6 = pkt['ipv6']
+                    srcIP, dstIP = ip6.src, ip6.dst
+                    IPtype = 1
                 except Exception:
                     pass
-            elif hasattr(pkt, 'icmp'):
-                srcproto = dstproto = 'icmp'
-                IPtype = 0
 
+            # Transport
             try:
-                srcMAC = pkt.eth.src
-                dstMAC = pkt.eth.dst
+                tcp = pkt['tcp']
+                srcproto = str(tcp.srcport)
+                dstproto = str(tcp.dstport)
+            except Exception:
+                try:
+                    udp = pkt['udp']
+                    srcproto = str(udp.srcport)
+                    dstproto = str(udp.dstport)
+                except Exception:
+                    try:
+                        pkt['arp']
+                        srcproto = dstproto = 'arp'
+                        try:
+                            srcIP = pkt['arp'].src_proto_ipv4
+                            dstIP = pkt['arp'].dst_proto_ipv4
+                            IPtype = 0
+                        except Exception:
+                            pass
+                    except Exception:
+                        try:
+                            pkt['icmp']
+                            srcproto = dstproto = 'icmp'
+                            IPtype = 0
+                        except Exception:
+                            pass
+
+            # Ethernet
+            try:
+                eth = pkt['eth']
+                srcMAC = eth.src
+                dstMAC = eth.dst
             except Exception:
                 pass
 
             if srcIP == '' and srcproto == '':
                 srcIP, dstIP = srcMAC, dstMAC
 
-            # [FIX-3] : updateGetStats (camelCase) — API réelle Kitsune-py
             vec = self._nstat.updateGetStats(
                 IPtype, srcMAC, dstMAC,
                 srcIP, srcproto, dstIP, dstproto,
@@ -276,23 +320,24 @@ class AfterImageExtractor:
 class NetworkCapture:
     """
     Capture réseau double pipeline.
-    [FIX-2] Interface auto-détectée (Windows compatible).
-    [FIX-5] Thread de capture crée sa propre boucle asyncio (Windows).
+    [FIX-3] FLOW_TIMEOUT = 5s, MAX_FLOW_PKTS = 50
+    [FIX-4] Flush périodique toutes les 3s
+    [FIX-5] Logs détaillés de diagnostic
     """
-    FLOW_TIMEOUT  = 30.0
-    MAX_FLOW_PKTS = 200
+    # [FIX-3] Valeurs réduites pour émission rapide
+    FLOW_TIMEOUT  = 5.0
+    MAX_FLOW_PKTS = 50
 
     def __init__(
         self,
-        interface:        str                = "",   # vide = auto-détection
+        interface:        str                = "",
         bpf_filter:       str                = "ip",
         on_flow:          Optional[Callable] = None,
         on_packet_vector: Optional[Callable] = None,
         use_pcap:         Optional[str]      = None,
-        flow_timeout:     float              = 30.0,
-        max_flow_pkts:    int                = 200,
+        flow_timeout:     float              = 5.0,
+        max_flow_pkts:    int                = 50,
     ):
-        # [FIX-2] Auto-détection si interface non spécifiée ou "eth0" sur Windows
         if not interface or (interface == "eth0" and sys.platform == "win32"):
             interface = _detect_interface()
 
@@ -313,21 +358,51 @@ class NetworkCapture:
         self._total_pkts  = 0
         self._total_flows = 0
 
+        # Compteurs de diagnostic
+        self._pkts_with_ip   = 0
+        self._pkts_no_layer  = 0
+        self._vecs_sent      = 0
+        self._last_log_time  = time.time()
+
+    # ── [FIX-2] Flow key robuste ──────────────────────────────────
     def _flow_key(self, pkt) -> Optional[tuple]:
+        """
+        Extrait la clé de flux. Utilise l'indexation par string
+        au lieu de hasattr() pour éviter les faux négatifs pyshark.
+        """
         try:
-            if not hasattr(pkt, 'ip'):
+            # Tenter d'accéder à la couche IP via indexation (plus fiable)
+            try:
+                ip = pkt['ip']
+                src = ip.src
+                dst = ip.dst
+            except Exception:
+                # Pas de couche IP — ignorer silencieusement
+                self._pkts_no_layer += 1
                 return None
-            src   = pkt.ip.src
-            dst   = pkt.ip.dst
-            proto = (pkt.transport_layer or "OTHER").upper()
+
+            # Transport
+            proto = "OTHER"
             sp = dp = 0
-            if proto in ("TCP", "UDP"):
+            try:
+                tcp = pkt['tcp']
+                proto = "TCP"
+                sp = int(tcp.srcport)
+                dp = int(tcp.dstport)
+            except Exception:
                 try:
-                    layer = pkt[proto.lower()]
-                    sp = int(getattr(layer, "srcport", 0))
-                    dp = int(getattr(layer, "dstport", 0))
+                    udp = pkt['udp']
+                    proto = "UDP"
+                    sp = int(udp.srcport)
+                    dp = int(udp.dstport)
                 except Exception:
-                    pass
+                    try:
+                        pkt['icmp']
+                        proto = "ICMP"
+                    except Exception:
+                        pass
+
+            self._pkts_with_ip += 1
             return (src, dst, sp, dp, proto)
         except Exception:
             return None
@@ -354,16 +429,17 @@ class NetworkCapture:
             flow.spkts    += 1
             flow.last_seen = now
             try:
-                flow.sttl = int(pkt.ip.ttl)
+                flow.sttl = int(pkt['ip'].ttl)
             except Exception:
                 pass
             try:
-                flags = int(pkt.tcp.flags, 16)
+                flags = int(pkt['tcp'].flags, 16)
                 if flags & 0x02: flow.syn_seen = True
                 if flags & 0x12 and flow.syn_seen and not flow.synack_time:
                     flow.synack_time = now
                 if flags & 0x10 and flow.synack_time and not flow.ack_time:
                     flow.ack_time = now
+                # FIN ou RST → émettre le flux
                 if flags & 0x01 or flags & 0x04:
                     emit = True
             except Exception:
@@ -384,20 +460,45 @@ class NetworkCapture:
                 print(f"[FLOW CB] {e}")
 
     def _timeout_checker(self):
+        """
+        [FIX-4] Flush toutes les 3s (au lieu de 5s) + flush forcé
+        des flux actifs même non expirés si > 2 paquets
+        """
         while self._running:
             now = time.time()
+
             with self._flows_lock:
+                # Flux expirés
                 expired = [k for k, v in list(self._flows.items())
                            if now - v.last_seen > self.FLOW_TIMEOUT]
-            for k in expired:
+                # [FIX-4] Flush forcé des flux avec assez de paquets
+                forced = [k for k, v in list(self._flows.items())
+                          if k not in expired and len(v.packets) >= 3
+                          and now - v.last_seen > 1.0]
+
+            for k in expired + forced:
                 self._emit_flow(k)
-            time.sleep(5)
+
+            # [FIX-5] Log de diagnostic toutes les 10s
+            if now - self._last_log_time > 10.0:
+                self._last_log_time = now
+                with self._flows_lock:
+                    active = len(self._flows)
+                with self._pps_lock:
+                    pps = len(self._pps_window)
+                print(
+                    f"[CAPTURE] pkts={self._total_pkts}  ip={self._pkts_with_ip}"
+                    f"  no_layer={self._pkts_no_layer}  flows_emis={self._total_flows}"
+                    f"  flows_actifs={active}  vecs={self._vecs_sent}  pps≈{pps}"
+                )
+
+            time.sleep(3)
 
     def start(self):
         if not PYSHARK_AVAILABLE:
             raise RuntimeError("pyshark non installé — pip install pyshark")
 
-        # [FIX-5] Créer une boucle asyncio pour ce thread (Windows)
+        # [FIX-5] Boucle asyncio propre pour Windows
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
@@ -419,6 +520,8 @@ class NetworkCapture:
                 eventloop  = loop,
             )
 
+        print(f"[CAPTURE] Thread démarré")
+
         try:
             for pkt in cap.sniff_continuously():
                 if not self._running:
@@ -434,6 +537,7 @@ class NetworkCapture:
                 # Pipeline A : AfterImage → KitNET
                 vec = self._afterimage.extract(pkt)
                 if vec is not None:
+                    self._vecs_sent += 1
                     try:
                         self.on_packet_vector(vec)
                     except Exception as e:
@@ -452,7 +556,10 @@ class NetworkCapture:
                 cap.close()
             except Exception:
                 pass
-            loop.close()
+            try:
+                loop.close()
+            except Exception:
+                pass
 
     def stop(self):
         self._running = False

@@ -1,11 +1,11 @@
 """
-engines/zero_day.py
-===================
-Wrapper KitNET pour la détection d'anomalies zero-day.
-
-Mode normal   : reçoit vecteurs AfterImage (~115 features) via process_vector()
-Mode dégradé  : reçoit features UNSW-NB15 (13 colonnes) via process()
-Mode unavailable : KitNET-py non cloné
+engines/zero_day.py — CORRIGÉ v2
+==================================
+FIXES :
+[FIX-1] configure_n_features() : suppression du guard `packet_count > 0`
+         qui empêchait la reconfiguration au 1er vecteur AfterImage (100 features)
+[FIX-2] Affichage du nombre de features réel à l'init et à la config
+[FIX-3] n_features=0 par défaut → auto-config au 1er vecteur (comportement voulu)
 """
 
 import sys
@@ -13,7 +13,6 @@ import pickle
 import numpy as np
 from pathlib import Path
 
-# Cherche KitNET.py dans Kitsune-py ou KitNET-py
 _PROJECT_ROOT = Path(__file__).parent.parent
 _CANDIDATES = [
     _PROJECT_ROOT / "Kitsune-py",
@@ -32,7 +31,6 @@ try:
 except ImportError:
     KITNET_AVAILABLE = False
     print("[WARN] KitNET non trouvé")
-    print("       git clone https://github.com/ymirsky/Kitsune-py.git")
 
 FALLBACK_FEATURES = [
     'dur', 'sbytes', 'dbytes', 'Sload', 'Dload',
@@ -45,13 +43,7 @@ class ZeroDayEngine:
     """
     Détection d'anomalies via KitNET.
 
-    Paramètres
-    ----------
-    fm_grace      : paquets pour la phase Feature Mapping
-    ad_grace      : paquets pour la phase Anomaly Detection
-    max_ae_size   : taille max de chaque autoencoder
-    learning_rate : taux d'apprentissage
-    n_features    : 0 = auto-détecté depuis AfterImage
+    n_features=0 → auto-config au 1er vecteur AfterImage reçu.
     """
 
     def __init__(
@@ -62,13 +54,16 @@ class ZeroDayEngine:
         learning_rate: float = 0.1,
         n_features:    int   = 0,
     ):
-        self.fm_grace    = fm_grace
-        self.ad_grace    = ad_grace
-        self.grace_total = fm_grace + ad_grace
-        self._n          = n_features if n_features > 0 else len(FALLBACK_FEATURES)
-        self._kitnet     = None
+        self.fm_grace      = fm_grace
+        self.ad_grace      = ad_grace
+        self.grace_total   = fm_grace + ad_grace
+        self.max_ae_size   = max_ae_size
+        self.learning_rate = learning_rate
+        self._n            = n_features if n_features > 0 else len(FALLBACK_FEATURES)
+        self._kitnet       = None
+        self._configured   = (n_features > 0)  # True si n_features explicite
 
-        if KITNET_AVAILABLE:
+        if KITNET_AVAILABLE and n_features > 0:
             self._kitnet = kit.KitNET(
                 n                    = self._n,
                 max_autoencoder_size = max_ae_size,
@@ -77,6 +72,9 @@ class ZeroDayEngine:
                 learning_rate        = learning_rate,
                 hidden_ratio         = 0.75,
             )
+            print(f"[KitNET] Initialisé avec {self._n} features")
+        elif KITNET_AVAILABLE:
+            print(f"[KitNET] n_features=0 → auto-config au 1er vecteur AfterImage")
 
         self.rmse_history: list[float] = []
         self.threshold:    float       = 0.1
@@ -85,36 +83,62 @@ class ZeroDayEngine:
         self._mode = "afterimage" if KITNET_AVAILABLE else "unavailable"
 
     def configure_n_features(self, n: int):
-        """Reconfigure KitNET si le nombre réel de features diffère."""
-        if n == self._n or not KITNET_AVAILABLE or self.packet_count > 0:
+        """
+        [FIX-1] Reconfigure KitNET avec le vrai nombre de features AfterImage.
+        Suppression du guard `packet_count > 0` — on reconfigure avant le 1er paquet.
+        """
+        if n == self._n and self._configured:
             return
+        if not KITNET_AVAILABLE:
+            return
+
+        print(f"[KitNET] Reconfiguration : {self._n} → {n} features")
         self._n = n
-        max_ae = self._kitnet.FM.maxAE if self._kitnet else 10
         self._kitnet = kit.KitNET(
-            n=n, max_autoencoder_size=max_ae,
-            FM_grace_period=self.fm_grace,
-            AD_grace_period=self.ad_grace,
-            learning_rate=0.1, hidden_ratio=0.75,
+            n                    = n,
+            max_autoencoder_size = self.max_ae_size,
+            FM_grace_period      = self.fm_grace,
+            AD_grace_period      = self.ad_grace,
+            learning_rate        = self.learning_rate,
+            hidden_ratio         = 0.75,
         )
+        self._configured = True
+        print(f"[KitNET] KitNET recréé avec {n} features — OK")
 
     def process_vector(self, vec: np.ndarray) -> dict:
         """Traite un vecteur AfterImage (mode optimal)."""
-        if self._kitnet is None:
+        if not KITNET_AVAILABLE:
             return self._unavailable_result()
-        if len(vec) != self._n and self.packet_count == 0:
+
+        # [FIX-1] Auto-config au 1er appel si pas encore configuré
+        if not self._configured or (self._kitnet is None):
             self.configure_n_features(len(vec))
+
+        if len(vec) != self._n:
+            # Taille inattendue après config — reconfigurer
+            self.configure_n_features(len(vec))
+
         return self._process_raw(vec)
 
     def process(self, features: dict) -> dict:
         """Mode dégradé — features UNSW-NB15 par flux."""
         if self._kitnet is None:
-            return self._unavailable_result()
+            if not self._configured and KITNET_AVAILABLE:
+                self.configure_n_features(len(FALLBACK_FEATURES))
+            else:
+                return self._unavailable_result()
         vec = np.array([float(features.get(col, 0)) for col in FALLBACK_FEATURES], dtype=np.float64)
         return self._process_raw(vec)
 
     def _process_raw(self, vec: np.ndarray) -> dict:
         vec  = np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
-        rmse = float(self._kitnet.process(vec))
+
+        try:
+            rmse = float(self._kitnet.process(vec))
+        except Exception as e:
+            print(f"[KitNET] process() error : {e}")
+            return self._unavailable_result()
+
         self.rmse_history.append(rmse)
         self.packet_count += 1
 
@@ -122,7 +146,7 @@ class ZeroDayEngine:
             window = np.array(self.rmse_history[-min(10_000, len(self.rmse_history)):])
             self.threshold = float(np.mean(window) + 3 * np.std(window))
             self.trained   = True
-            print(f"[KitNET] Entraîné — seuil automatique = {self.threshold:.6f}")
+            print(f"[KitNET] ✓ Entraîné — seuil automatique = {self.threshold:.6f}")
 
         progress = min(self.packet_count / self.grace_total, 1.0)
 
@@ -189,6 +213,9 @@ class ZeroDayEngine:
         e.grace_total   = e.fm_grace + e.ad_grace
         e._n            = s.get("n_features", len(FALLBACK_FEATURES))
         e._mode         = s.get("mode", "afterimage")
+        e._configured   = True
+        e.max_ae_size   = 10
+        e.learning_rate = 0.1
         print(f"[KitNET] Chargé depuis {path} — {e.packet_count} paquets")
         return e
 
