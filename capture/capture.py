@@ -13,7 +13,30 @@ FIXES :
 [FIX-5] Log détaillé : paquets reçus, flux émis, vecteurs AfterImage
 [FIX-6] configure_n_features() : suppression du guard packet_count > 0
 """
-
+import numpy as np
+ 
+# Réinjecter les alias supprimés dans NumPy 2.0
+if not hasattr(np, 'Inf'):
+    np.Inf = np.inf
+if not hasattr(np, 'Infinity'):
+    np.Infinity = np.inf
+if not hasattr(np, 'NaN'):
+    np.NaN = np.nan
+if not hasattr(np, 'bool'):
+    np.bool = bool
+if not hasattr(np, 'int'):
+    np.int = int
+if not hasattr(np, 'float'):
+    np.float = float
+if not hasattr(np, 'complex'):
+    np.complex = complex
+if not hasattr(np, 'object'):
+    np.object = object
+if not hasattr(np, 'str'):
+    np.str = str
+ 
+print("[PATCH] numpy_compat_patch appliqué — np.Inf, np.NaN réinjectés")
+ 
 import os
 import sys
 import time
