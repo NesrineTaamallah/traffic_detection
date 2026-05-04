@@ -321,7 +321,8 @@ class ZeroDayEngine:
             print(f"[KitNET] Ce seuil sera REMPLACÉ après warm-up live ({PRETRAINED_WARMUP_PKTS} paquets)")
             threshold = float('inf')   # always recalibrate — Mirai ≠ your traffic
 
-        n_features = n_features or 100   # AfterImage default
+        self._n = None  # sera fixé au 1er appel process_vector()
+
 
         # ── Apply ─────────────────────────────────────────────────
         self._kitnet   = kitnet_obj
