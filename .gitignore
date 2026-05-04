@@ -1,0 +1,15 @@
+# Environnements Python
+mon_env/
+venv/
+.env/
+
+# Node.js
+node_modules/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Modèles lourds
+models/
+*.pkl
