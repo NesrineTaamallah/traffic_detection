@@ -1,16 +1,22 @@
 """
-api/main.py  —  CORRIGÉ v2.1
-==============================
-CORRECTIONS :
-  [FIX-1] pps_series : mis à jour dans on_packet_vector (pas seulement on_flow)
-  [FIX-2] capture_stats : utilise state["stats"]["total_pkts"] + pps_series,
-           évite la référence directe à `capture` qui peut être indéfinie
-  [FIX-3] ZeroDayEngine configuré avec n_features=100 (AfterImage réel)
-           ou auto-reconfiguration propre au 1er vecteur
-  [FIX-4] on_flow : le pps est lu depuis pps_series[-1] (thread-safe)
-  [FIX-5] _last_flow_result : fusion correcte zero/known sans race condition
-  [FIX-6] payload kitnet : inclut rmse_last pour le sparkline RMSE
-  [FIX-7] Mode production : demo_tick() retiré du push_loop quand MODELS_AVAILABLE
+api/main.py  —  v2.2  PRETRAINED KITNET
+=========================================
+
+KEY CHANGE vs v2.1:
+  ZeroDayEngine is now loaded from the pre-trained Mirai pkl first.
+  This eliminates the false-positive storm caused by online training on
+  live Wi-Fi traffic (threshold was too low → everything = Zero-day).
+
+Priority order for KitNET initialisation:
+  1. models/kitsune_mirai_model.pkl  ← pre-trained offline (recommended)
+  2. models/kitnet_state.pkl         ← your own previous online save
+  3. Fresh online training           ← fallback (slower, FP-prone)
+
+Other fixes carried over from v2.1:
+  [FIX-1] pps_series updated in on_packet_vector
+  [FIX-2] capture_stats uses state["stats"]["total_pkts"]
+  [FIX-4] on_flow: pps read from pps_series (thread-safe)
+  [FIX-6] payload kitnet includes rmse_last
 """
 
 import asyncio
@@ -39,6 +45,7 @@ try:
     from engines.known_attack import KnownAttackEngine
     from engines.zero_day     import ZeroDayEngine
     from fusion.decision      import DecisionFusion, Severity
+
     _models_path = Path("./models")
     _required = [
         "best_binary_model.pkl",
@@ -48,16 +55,16 @@ try:
     ]
     if all((_models_path / f).exists() for f in _required):
         MODELS_AVAILABLE = True
-        print("[INFO] Modèles trouvés — mode production activé")
+        print("[INFO] Modèles XGBoost trouvés — mode production activé")
     else:
         missing = [f for f in _required if not (_models_path / f).exists()]
-        print(f"[WARN] Modèles manquants : {missing}")
-        print("[INFO] Mode démo activé — trafic synthétique")
+        print(f"[WARN] Modèles XGBoost manquants : {missing}")
+        print("[INFO] Mode démo activé")
 except ImportError as e:
     print(f"[WARN] Engines non disponibles : {e}")
     print("[INFO] Mode démo activé")
 
-app = FastAPI(title="NIDS API", version="2.1")
+app = FastAPI(title="NIDS API", version="2.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
@@ -80,22 +87,18 @@ state = {
 }
 _ws_clients: list[WebSocket] = []
 
-# Compteur PPS thread-safe
 _pps_window: list[float] = []
 _pps_lock   = threading.Lock()
 
-# Last flow context pour fusion zero-day + known
 _last_flow_result: dict = {}
 _last_flow_lock   = threading.Lock()
 
 
 def _record_pps_tick():
-    """Enregistre un paquet dans la fenêtre PPS glissante d'1 seconde."""
     now = time.time()
     with _pps_lock:
         _pps_window.append(now)
         cutoff = now - 1.0
-        # Nettoyage : garder seulement la dernière seconde
         while _pps_window and _pps_window[0] < cutoff:
             _pps_window.pop(0)
         pps = len(_pps_window)
@@ -118,12 +121,31 @@ def _record_alert(alert):
 if MODELS_AVAILABLE:
     known_engine = KnownAttackEngine(models_dir="./models")
 
-    # [FIX-3] : on laisse n_features=0 pour l'auto-config au 1er vecteur AfterImage
-    zero_engine = ZeroDayEngine(fm_grace=5_000, ad_grace=50_000, n_features=0)
-    fusion      = DecisionFusion()
+    # ── KitNET: pre-trained first, then fallbacks ─────────────────
+    _pretrained_pkl = Path(r"C:\Users\nesri\OneDrive\Desktop\network_traffic_detection\models\kitsune_mirai_model.pkl")
+    _saved_state    = Path("./models/kitnet_state.pkl")
+
+    if _pretrained_pkl.exists():
+        print(f"\n[KITNET] Chargement du modèle pré-entraîné Mirai: {_pretrained_pkl}")
+        zero_engine = ZeroDayEngine(
+            pretrained_path=str(_pretrained_pkl),
+        )
+    elif _saved_state.exists():
+        print(f"\n[KITNET] Chargement état sauvegardé: {_saved_state}")
+        zero_engine = ZeroDayEngine.load(str(_saved_state))
+    else:
+        print("\n[KITNET] Aucun modèle pré-entraîné — démarrage en mode online")
+        print("[KITNET] AVERTISSEMENT: des faux positifs Zero-day sont possibles")
+        print(f"[KITNET]   Placez kitsune_mirai_model.pkl dans ./models/ pour éviter ça")
+        zero_engine = ZeroDayEngine(
+            fm_grace   = 5_000,
+            ad_grace   = 50_000,
+            n_features = 0,
+        )
+
+    fusion = DecisionFusion()
 
     def _get_zero_snapshot() -> dict:
-        """Snapshot thread-safe de l'état KitNET."""
         hist = zero_engine.rmse_history
         r = hist[-1] if hist else 0.0
         trained = zero_engine.trained
@@ -131,30 +153,25 @@ if MODELS_AVAILABLE:
         return {
             "rmse":           round(r, 6),
             "is_anomaly":     trained and r > thr,
-            "phase":          "monitoring" if trained else "training",
-            "progress":       min(zero_engine.packet_count / max(zero_engine.grace_total, 1), 1.0),
+            "phase":          zero_engine._mode if zero_engine._pretrained else (
+                              "monitoring" if trained else "training"),
+            "progress":       1.0 if zero_engine._pretrained else min(
+                              zero_engine.packet_count / max(zero_engine.grace_total, 1), 1.0),
             "threshold":      round(thr, 6),
             "severity_score": round(r / max(thr, 1e-9), 3) if trained else 0.0,
             "trained":        trained,
         }
 
     def on_packet_vector(vec):
-        """
-        [FIX-1] Pipeline A : appelé pour chaque paquet capturé.
-        Met à jour PPS, RMSE, et tente une fusion si une anomalie est détectée.
-        """
-        # Incrément paquet
         state["stats"]["total_pkts"] += 1
         _record_pps_tick()
 
-        # KitNET
         zero_result = zero_engine.process_vector(vec)
         state["rmse_series"].append({
             "ts":   time.time(),
             "rmse": zero_result["rmse"],
         })
 
-        # Fusion immédiate si anomalie après entraînement
         if zero_result.get("is_anomaly") and zero_result.get("trained"):
             with _last_flow_lock:
                 last = dict(_last_flow_result)
@@ -172,12 +189,7 @@ if MODELS_AVAILABLE:
                     print(f"[FUSION] Erreur : {e}")
 
     def on_flow(features: dict):
-        """
-        Pipeline B : appelé quand un flux TCP/UDP est terminé.
-        Classification XGBoost + fusion avec dernier état KitNET.
-        """
         state["stats"]["total_flows"] += 1
-
         try:
             known_result = known_engine.predict(features)
         except Exception as e:
@@ -186,7 +198,6 @@ if MODELS_AVAILABLE:
 
         zero_result = _get_zero_snapshot()
 
-        # Mémorise pour fusion future (on_packet_vector)
         with _last_flow_lock:
             _last_flow_result.clear()
             _last_flow_result.update({
@@ -195,7 +206,6 @@ if MODELS_AVAILABLE:
                 "zero_result":  zero_result,
             })
 
-        # Fusion immédiate sur le flux
         try:
             alert = fusion.decide(features, known_result, zero_result)
             if alert:
@@ -207,7 +217,7 @@ if MODELS_AVAILABLE:
     if CAPTURE_AVAILABLE:
         try:
             capture = NetworkCapture(
-                interface        = "",          # auto-détection
+                interface        = "",
                 bpf_filter       = "ip",
                 on_flow          = on_flow,
                 on_packet_vector = on_packet_vector,
@@ -230,11 +240,12 @@ ATTACK_TYPES = [
     "DoS GoldenEye", "DoS Hulk", "DoS Slowloris",
     "Fuzzers", "Backdoor", "Analysis",
     "Port Scan", "Worms", "Exploits", "Shellcode",
+    "Mirai Botnet", "Mirai DDoS", "Mirai Scan",
 ]
 DEMO_IPS = [f"192.168.1.{i}" for i in range(10, 30)]
 
-_demo_counter     = 0
-_demo_rmse_base   = 0.03
+_demo_counter      = 0
+_demo_rmse_base    = 0.03
 _demo_packet_count = 0
 _demo_grace_total  = 200
 
@@ -249,8 +260,8 @@ def _demo_tick() -> dict:
 
     _demo_counter += 1
     t = _demo_counter * 0.15
-    base_rmse  = _demo_rmse_base + 0.008 * math.sin(t) + random.gauss(0, 0.003)
-    threshold  = _demo_rmse_base * 3.5 if trained else 0.0
+    base_rmse    = _demo_rmse_base + 0.008 * math.sin(t) + random.gauss(0, 0.003)
+    threshold    = _demo_rmse_base * 3.5 if trained else 0.0
     attack_burst = (_demo_counter % 60) < 10 and trained
     rmse = base_rmse + random.uniform(0.05, 0.18) if attack_burst else max(base_rmse, 0.001)
 
@@ -267,7 +278,7 @@ def _demo_tick() -> dict:
         "threshold":    round(threshold, 6),
         "trained":      trained,
         "progress":     round(progress, 4),
-        "n_features":   115,
+        "n_features":   100,
         "mode":         "demo",
         "rmse_last":    round(rmse, 6),
     }
@@ -333,25 +344,32 @@ async def push_loop():
     while True:
         try:
             if not MODELS_AVAILABLE:
-                # Mode démo
                 kitnet_info = _demo_tick()
             else:
-                # [FIX-6] Mode production : construit kitnet_info depuis zero_engine
-                hist = zero_engine.rmse_history
+                hist      = zero_engine.rmse_history
                 last_rmse = hist[-1] if hist else 0.0
+
+                # Mode label for dashboard
+                if zero_engine._pretrained:
+                    mode_label = f"pretrained ({zero_engine._mode})"
+                    progress   = 1.0
+                else:
+                    mode_label = "online"
+                    progress   = round(
+                        min(zero_engine.packet_count / max(zero_engine.grace_total, 1), 1.0), 4
+                    )
+
                 kitnet_info = {
                     "packet_count": zero_engine.packet_count,
                     "threshold":    round(zero_engine.threshold, 6),
                     "trained":      zero_engine.trained,
-                    "progress":     round(
-                        min(zero_engine.packet_count / max(zero_engine.grace_total, 1), 1.0), 4
-                    ),
+                    "progress":     progress,
                     "n_features":   zero_engine.n_features,
-                    "mode":         zero_engine._mode,
+                    "mode":         mode_label,
                     "rmse_last":    round(last_rmse, 6),
+                    "pretrained":   zero_engine._pretrained,
                 }
 
-            # [FIX-2] PPS depuis la série (thread-safe, pas de ref à `capture`)
             cur_pps = state["pps_series"][-1]["pps"] if state["pps_series"] else 0
 
             payload = {
@@ -413,28 +431,86 @@ def get_stats():
             "packet_count": zero_engine.packet_count,
             "trained":      zero_engine.trained,
             "threshold":    zero_engine.threshold,
+            "pretrained":   zero_engine._pretrained,
+            "mode":         zero_engine._mode,
         }
     return base
 
 
 @app.get("/health")
 def health():
-    return {
+    info = {
         "status":            "ok",
         "models_available":  MODELS_AVAILABLE,
         "capture_available": CAPTURE_AVAILABLE,
         "demo_mode":         not MODELS_AVAILABLE,
     }
+    if MODELS_AVAILABLE:
+        info["kitnet_pretrained"] = zero_engine._pretrained
+        info["kitnet_threshold"]  = zero_engine.threshold
+        info["kitnet_mode"]       = zero_engine._mode
+    return info
+
+
+@app.get("/kitnet/inspect")
+def inspect_pkl():
+    """
+    Endpoint de diagnostic: inspect the Mirai pkl structure.
+    Useful if loading fails.
+    """
+    pkl_path = Path("./models/kitsune_mirai_model.pkl")
+    if not pkl_path.exists():
+        return {"error": "kitsune_mirai_model.pkl not found in ./models/"}
+
+    import pickle
+    with open(pkl_path, "rb") as f:
+        obj = pickle.load(f)
+
+    info = {"type": type(obj).__name__}
+    if isinstance(obj, dict):
+        info["keys"] = list(obj.keys())
+        for k, v in obj.items():
+            info[f"key_{k}"] = {
+                "type": type(v).__name__,
+                "value": str(v)[:100] if isinstance(v, (int, float, str, bool)) else "...",
+            }
+    elif isinstance(obj, (list, tuple)):
+        info["length"] = len(obj)
+        info["element_types"] = [type(x).__name__ for x in obj]
+    elif hasattr(obj, "__dict__"):
+        info["attrs"] = list(obj.__dict__.keys())[:20]
+
+    return info
 
 
 if MODELS_AVAILABLE:
     @app.post("/kitnet/save")
     def save_kitnet():
         zero_engine.save("./models/kitnet_state.pkl")
-        return {"status": "saved", "packet_count": zero_engine.packet_count}
+        return {
+            "status":     "saved",
+            "packet_count": zero_engine.packet_count,
+            "pretrained": zero_engine._pretrained,
+        }
 
     @app.post("/kitnet/reset")
     def reset_kitnet():
         global zero_engine
+        # Reset to online mode (loses pre-trained state)
         zero_engine = ZeroDayEngine(fm_grace=5_000, ad_grace=50_000, n_features=0)
-        return {"status": "reset"}
+        return {"status": "reset", "mode": "online"}
+
+    @app.post("/kitnet/reload_pretrained")
+    def reload_pretrained():
+        """Hot-reload the Mirai pkl without restarting the server."""
+        global zero_engine
+        pkl = Path("./models/kitsune_mirai_model.pkl")
+        if not pkl.exists():
+            return {"error": "kitsune_mirai_model.pkl not found"}
+        zero_engine = ZeroDayEngine(pretrained_path=str(pkl))
+        return {
+            "status":    "reloaded",
+            "pretrained": zero_engine._pretrained,
+            "threshold":  zero_engine.threshold,
+            "n_features": zero_engine.n_features,
+        }
