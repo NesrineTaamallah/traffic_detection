@@ -32,7 +32,6 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.analyze import router as analyze_router
-app.include_router(analyze_router)
 
 # ── Imports conditionnels ─────────────────────────────────────────
 MODELS_AVAILABLE  = False
@@ -72,6 +71,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
+app.include_router(analyze_router)
+
 
 # ── État partagé ──────────────────────────────────────────────────
 state = {

@@ -1,13 +1,14 @@
 """
-api/analyze.py — v2 FINAL
+api/analyze.py — v3 FIXED
 ===========================
+FIX: ValueError when CSV contains IP address strings in feature columns.
+  - Expanded META_COLS to catch more IP/address column name variants
+  - _safe_float() helper used everywhere instead of bare float()
+  - numeric_vec builder is now crash-proof against string values
+
 Endpoint /api/analyze  : CSV + PCAP → XGBoost + KitNET → résultats JSON
 Endpoint /api/report   : export JSON/CSV du rapport d'analyse
-Endpoint /api/report/pdf : export rapport PDF textuel
-
-Ajouter dans api/main.py :
-    from api.analyze import router as analyze_router
-    app.include_router(analyze_router)
+Endpoint /api/report/txt : export rapport textuel
 """
 
 import io
@@ -27,10 +28,21 @@ from fastapi.responses import JSONResponse, StreamingResponse
 router = APIRouter(prefix="/api")
 
 # ── Meta colonnes non-feature ──────────────────────────────────────
+# All columns that should NEVER be treated as numeric features.
+# Expanded to catch IP/address variants that appear in UNSW-NB15 and similar.
 META_COLS = {
+    # Standard UNSW-NB15 meta
     'srcip', 'sport', 'dstip', 'dsport', 'proto', 'state', 'service',
     'label', 'attack_cat', 'Label', 'class', 'Category',
     'id', 'row_id', 'index', 'num', 'No.',
+    # IP address column name variants
+    'src_ip', 'dst_ip', 'src', 'dst', 'ip_src', 'ip_dst',
+    'source', 'destination', 'src_addr', 'dst_addr',
+    'Source', 'Destination', 'source_ip', 'destination_ip',
+    'ip.src', 'ip.dst', 'Source IP', 'Destination IP',
+    # Other common non-numeric columns
+    'timestamp', 'date', 'time', 'Timestamp', 'flow_id', 'Flow ID',
+    'src_mac', 'dst_mac', 'mac_src', 'mac_dst',
 }
 
 LABEL_COLS = ['label', 'Label', 'attack_cat', 'Category', 'class', 'attack_type']
@@ -42,7 +54,6 @@ _PORT_TO_SERVICE = {
     8080: 'http', 8443: 'ssl', 1812: 'radius', 1813: 'radius',
 }
 
-# Thread-local session storage for last analysis (for report export)
 _last_analysis: dict = {}
 _analysis_lock = threading.Lock()
 
@@ -50,6 +61,40 @@ _analysis_lock = threading.Lock()
 # ═══════════════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════════════
+
+def _safe_float(val) -> float:
+    """
+    Convert val to float safely.
+    Returns 0.0 for None, NaN, inf, or any non-numeric string (e.g. '59.166.0.0').
+    """
+    if val is None:
+        return 0.0
+    try:
+        f = float(val)
+        if not np.isfinite(f):
+            return 0.0
+        return f
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _is_numeric_col(series: pd.Series) -> bool:
+    """
+    Heuristic: a column is numeric if at least 80% of non-null values
+    can be converted to float. Rejects IP address columns, etc.
+    """
+    sample = series.dropna().head(50)
+    if len(sample) == 0:
+        return True  # empty column, keep it as 0-filled numeric
+    successes = 0
+    for v in sample:
+        try:
+            float(v)
+            successes += 1
+        except (TypeError, ValueError):
+            pass
+    return successes / len(sample) >= 0.8
+
 
 def _detect_label_col(df: pd.DataFrame) -> Optional[str]:
     for col in LABEL_COLS:
@@ -85,7 +130,6 @@ def _infer_severity(is_attack: bool, confidence: float,
 
 
 def _load_engines():
-    """Lazy import des engines depuis api.main (évite import circulaire)."""
     try:
         import importlib
         main = importlib.import_module("api.main")
@@ -104,7 +148,6 @@ def _load_engines():
 
 def _analyze_row(raw: dict, known_engine, zero_engine,
                  numeric_vec: Optional[np.ndarray] = None) -> dict:
-    """Analyse un flux (dict de features) → résultat unifié."""
     # ── XGBoost ─────────────────────────────────────────────────
     try:
         known_result = known_engine.predict(raw)
@@ -150,7 +193,6 @@ def _analyze_row(raw: dict, known_engine, zero_engine,
 
 
 def _fallback_result_from_label(label_val, attack_cat: str) -> dict:
-    """Résultat heuristique quand les modèles ne sont pas disponibles."""
     true_lbl    = _get_true_label(label_val)
     is_attack   = bool(true_lbl) if true_lbl is not None else False
     attack_type = (attack_cat
@@ -193,52 +235,59 @@ def _analyze_csv(df: pd.DataFrame, known_engine, zero_engine,
                  engines_ok: bool, max_rows: int = 5000) -> tuple[list[dict], bool, Optional[str]]:
     label_col = _detect_label_col(df)
     has_labels = label_col is not None
-    feature_cols = [c for c in df.columns if c not in META_COLS]
+
+    # Build feature_cols: exclude meta columns AND non-numeric columns
+    raw_feature_cols = [c for c in df.columns if c not in META_COLS]
+    feature_cols = [c for c in raw_feature_cols if _is_numeric_col(df[c])]
+
+    excluded = set(raw_feature_cols) - set(feature_cols)
+    if excluded:
+        print(f"[ANALYZE] Colonnes non-numériques exclues : {sorted(excluded)}")
+
     results = []
 
     for idx in range(min(len(df), max_rows)):
         row = df.iloc[idx]
 
+        # Build raw feature dict — always safe
         raw = {}
         for col in feature_cols:
-            val = row.get(col)
-            try:
-                raw[col] = float(val) if pd.notna(val) else 0.0
-            except (TypeError, ValueError):
-                raw[col] = 0.0
+            raw[col] = _safe_float(row.get(col))
 
-        raw['_src_ip'] = str(row.get('srcip', f'host_{idx % 50}'))
-        raw['_dst_ip'] = str(row.get('dstip', f'srv_{idx % 10}'))
-        raw['_sport']  = int(row.get('sport', 0))  if pd.notna(row.get('sport', None)) else 0
-        raw['_dport']  = int(row.get('dsport', 80)) if pd.notna(row.get('dsport', None)) else 80
+        # Metadata fields (used by engines for context, not ML features)
+        raw['_src_ip'] = str(row.get('srcip', row.get('src_ip', f'host_{idx % 50}')))
+        raw['_dst_ip'] = str(row.get('dstip', row.get('dst_ip', f'srv_{idx % 10}')))
+        raw['_sport']  = int(_safe_float(row.get('sport', 0)))
+        raw['_dport']  = int(_safe_float(row.get('dsport', row.get('dport', 80))))
         raw['_proto']  = str(row.get('proto', 'tcp')).upper()
         raw['state']   = str(row.get('state', ''))
         raw['service'] = str(row.get('service', ''))
 
-        true_label  = _get_true_label(row.get(label_col)) if has_labels else None
-        attack_cat  = str(row.get('attack_cat', row.get('Category', ''))).strip()
+        true_label = _get_true_label(row.get(label_col)) if has_labels else None
+        attack_cat = str(row.get('attack_cat', row.get('Category', ''))).strip()
 
         if engines_ok:
-            # Vecteur numérique pour KitNET
+            # Numeric vector for KitNET — guaranteed float64, no strings
             numeric_vec = np.array(
-                [float(row.get(c, 0)) if pd.notna(row.get(c, None)) else 0.0
-                 for c in feature_cols],
+                [_safe_float(row.get(c, 0)) for c in feature_cols],
                 dtype=np.float64
             )
             numeric_vec = np.nan_to_num(numeric_vec, nan=0.0, posinf=0.0, neginf=0.0)
             numeric_vec = np.clip(numeric_vec, -1e6, 1e6)
             detection = _analyze_row(raw, known_engine, zero_engine, numeric_vec)
         else:
-            detection = _fallback_result_from_label(row.get(label_col) if has_labels else None, attack_cat)
+            detection = _fallback_result_from_label(
+                row.get(label_col) if has_labels else None, attack_cat
+            )
 
         result = {
-            "row_index":   idx,
-            "src_ip":      raw['_src_ip'],
-            "dst_ip":      raw['_dst_ip'],
-            "dport":       raw['_dport'],
-            "proto":       raw['_proto'],
-            "true_label":  true_label,
-            "attack_cat":  attack_cat,
+            "row_index":  idx,
+            "src_ip":     raw['_src_ip'],
+            "dst_ip":     raw['_dst_ip'],
+            "dport":      raw['_dport'],
+            "proto":      raw['_proto'],
+            "true_label": true_label,
+            "attack_cat": attack_cat,
         }
         result.update(detection)
         results.append(result)
@@ -252,11 +301,6 @@ def _analyze_csv(df: pd.DataFrame, known_engine, zero_engine,
 
 def _analyze_pcap(content: bytes, known_engine, zero_engine,
                   engines_ok: bool, max_pkts: int = 2000) -> tuple[list[dict], bool, None]:
-    """
-    Analyse un fichier PCAP via pyshark + AfterImage (netStat).
-    Tente d'utiliser le capture pipeline existant.
-    Si pyshark n'est pas disponible → erreur claire.
-    """
     try:
         import pyshark
     except ImportError:
@@ -264,7 +308,6 @@ def _analyze_pcap(content: bytes, known_engine, zero_engine,
                             detail="pyshark non installé — pip install pyshark. "
                                    "Utilisez un fichier CSV pour l'analyse sans pyshark.")
 
-    # Écrire le PCAP dans un fichier temporaire
     with tempfile.NamedTemporaryFile(suffix=".pcap", delete=False) as tmp:
         tmp.write(content)
         tmp_path = tmp.name
@@ -275,7 +318,6 @@ def _analyze_pcap(content: bytes, known_engine, zero_engine,
         from pathlib import Path as P
         PROJECT = P(tmp_path).parent.parent
 
-        # Essaye d'importer AfterImage
         afterimage_ok = False
         nstat = None
         for cand in [P("Kitsune-py"), P("KitNET-py"), P("kitsune-py")]:
@@ -293,7 +335,7 @@ def _analyze_pcap(content: bytes, known_engine, zero_engine,
         loop = asyncio.new_event_loop()
         cap = pyshark.FileCapture(tmp_path, keep_packets=False, eventloop=loop)
 
-        flow_records = {}  # (src,dst,sport,dport,proto) → dict
+        flow_records = {}
         pkt_count = 0
 
         def _flow_key_from_pkt(pkt):
@@ -320,7 +362,6 @@ def _analyze_pcap(content: bytes, known_engine, zero_engine,
             if not key:
                 continue
 
-            # Accumule le flux
             if key not in flow_records:
                 flow_records[key] = {
                     "src_ip": key[0], "dst_ip": key[1],
@@ -335,11 +376,10 @@ def _analyze_pcap(content: bytes, known_engine, zero_engine,
             except Exception:
                 pass
 
-            # AfterImage vector → KitNET
             if afterimage_ok and engines_ok and zero_engine:
                 try:
-                    ts  = float(pkt.sniff_timestamp)
-                    flen= int(pkt.length)
+                    ts   = float(pkt.sniff_timestamp)
+                    flen = int(pkt.length)
                     IPtype = 0
                     srcIP = dstIP = srcMAC = dstMAC = ""
                     srcproto = dstproto = ""
@@ -367,7 +407,6 @@ def _analyze_pcap(content: bytes, known_engine, zero_engine,
         try: loop.close()
         except Exception: pass
 
-        # Convertir les flows en résultats
         for idx, (key, fr) in enumerate(list(flow_records.items())[:2000]):
             pkts = fr["pkts"]
             dur  = (pkts[-1] - pkts[0]) if len(pkts) > 1 else 0.0
@@ -400,11 +439,11 @@ def _analyze_pcap(content: bytes, known_engine, zero_engine,
                 detection = _fallback_result_from_label(None, "")
 
             result = {
-                "row_index": idx,
-                "src_ip":    fr["src_ip"],
-                "dst_ip":    fr["dst_ip"],
-                "dport":     fr["dport"],
-                "proto":     fr["proto"],
+                "row_index":  idx,
+                "src_ip":     fr["src_ip"],
+                "dst_ip":     fr["dst_ip"],
+                "dport":      fr["dport"],
+                "proto":      fr["proto"],
                 "true_label": None,
                 "attack_cat": "",
                 "dur":        round(dur, 4),
@@ -436,12 +475,12 @@ def _compute_metrics(results: list[dict]) -> dict:
     for r in with_label:
         predicted = r["is_attack"] or r["is_anomaly"]
         actual    = bool(r["true_label"])
-        if predicted and actual:   tp += 1
+        if predicted and actual:          tp += 1
         elif not predicted and not actual: tn += 1
         elif predicted and not actual:     fp += 1
         else:                              fn += 1
 
-    total = len(with_label)
+    total     = len(with_label)
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1        = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
@@ -450,12 +489,12 @@ def _compute_metrics(results: list[dict]) -> dict:
     fnr       = fn / (fn + tp) if (fn + tp) > 0 else 0.0
 
     return {
-        "accuracy":  round(accuracy,  4),
-        "precision": round(precision, 4),
-        "recall":    round(recall,    4),
-        "f1":        round(f1,        4),
-        "fpr":       round(fpr,       4),
-        "fnr":       round(fnr,       4),
+        "accuracy":      round(accuracy,  4),
+        "precision":     round(precision, 4),
+        "recall":        round(recall,    4),
+        "f1":            round(f1,        4),
+        "fpr":           round(fpr,       4),
+        "fnr":           round(fnr,       4),
         "tp": tp, "tn": tn, "fp": fp, "fn": fn,
         "total_labeled": total,
     }
@@ -481,13 +520,13 @@ def _compute_summary(results: list[dict]) -> dict:
         "attacks":     attacks,
         "anomalies":   anomalies,
         "normals":     normals,
-        "pct_attack":  round(attacks / max(total, 1) * 100, 2),
+        "pct_attack":  round(attacks   / max(total, 1) * 100, 2),
         "pct_anomaly": round(anomalies / max(total, 1) * 100, 2),
-        "pct_normal":  round(normals / max(total, 1) * 100, 2),
+        "pct_normal":  round(normals   / max(total, 1) * 100, 2),
         "by_type":     by_type,
         "by_severity": by_severity,
         "rmse_mean":   round(float(np.mean(rmse_vals)), 6) if rmse_vals else 0.0,
-        "rmse_max":    round(float(np.max(rmse_vals)), 6) if rmse_vals else 0.0,
+        "rmse_max":    round(float(np.max(rmse_vals)),  6) if rmse_vals else 0.0,
         "threshold":   round(results[0].get("threshold", 0.0), 6) if results else 0.0,
     }
 
@@ -498,11 +537,7 @@ def _compute_summary(results: list[dict]) -> dict:
 
 @router.post("/analyze")
 async def analyze_file(file: UploadFile = File(...)):
-    """
-    Analyse un fichier CSV ou PCAP/PCAPNG.
-    Retourne les résultats XGBoost + KitNET + métriques si labels présents.
-    """
-    fname = file.filename or ""
+    fname   = file.filename or ""
     is_pcap = fname.lower().endswith((".pcap", ".pcapng"))
     is_csv  = fname.lower().endswith(".csv")
 
@@ -551,7 +586,6 @@ async def analyze_file(file: UploadFile = File(...)):
         "metrics":    metrics,
     }
 
-    # Stocker pour export rapport
     with _analysis_lock:
         _last_analysis.clear()
         _last_analysis.update(payload)
@@ -561,13 +595,12 @@ async def analyze_file(file: UploadFile = File(...)):
 
 @router.get("/report/json")
 def export_json():
-    """Télécharger le dernier rapport d'analyse au format JSON."""
     with _analysis_lock:
         if not _last_analysis:
             raise HTTPException(status_code=404, detail="Aucune analyse disponible")
         data = dict(_last_analysis)
 
-    content = json.dumps(data, indent=2, ensure_ascii=False)
+    content  = json.dumps(data, indent=2, ensure_ascii=False)
     filename = f"nids_report_{time.strftime('%Y%m%d_%H%M%S')}.json"
     return StreamingResponse(
         io.BytesIO(content.encode("utf-8")),
@@ -578,7 +611,6 @@ def export_json():
 
 @router.get("/report/csv")
 def export_csv():
-    """Télécharger le dernier rapport d'analyse au format CSV."""
     with _analysis_lock:
         if not _last_analysis:
             raise HTTPException(status_code=404, detail="Aucune analyse disponible")
@@ -591,24 +623,21 @@ def export_csv():
     output = io.StringIO()
     writer = csv_mod.writer(output)
 
-    # Header métadonnées
     writer.writerow(["# NIDS Analysis Report"])
     writer.writerow(["# Fichier analysé", meta.get("filename", "")])
-    writer.writerow(["# Date", meta.get("timestamp", "")])
-    writer.writerow(["# Lignes analysées", meta.get("analyzed", 0)])
-    writer.writerow(["# Engines OK", meta.get("engines_ok", False)])
+    writer.writerow(["# Date",            meta.get("timestamp", "")])
+    writer.writerow(["# Lignes analysées",meta.get("analyzed", 0)])
+    writer.writerow(["# Engines OK",      meta.get("engines_ok", False)])
     writer.writerow([])
 
-    # Summary
     summary = meta.get("summary", {})
     writer.writerow(["# Résumé"])
-    writer.writerow(["Total", summary.get("total", 0)])
-    writer.writerow(["Attaques XGBoost", summary.get("attacks", 0)])
-    writer.writerow(["Anomalies KitNET", summary.get("anomalies", 0)])
-    writer.writerow(["Normal", summary.get("normals", 0)])
+    writer.writerow(["Total",             summary.get("total", 0)])
+    writer.writerow(["Attaques XGBoost",  summary.get("attacks", 0)])
+    writer.writerow(["Anomalies KitNET",  summary.get("anomalies", 0)])
+    writer.writerow(["Normal",            summary.get("normals", 0)])
     writer.writerow([])
 
-    # Metrics
     metrics = meta.get("metrics", {})
     if metrics:
         writer.writerow(["# Métriques de performance"])
@@ -616,7 +645,6 @@ def export_csv():
             writer.writerow([k, v])
         writer.writerow([])
 
-    # Results
     if results:
         cols = ["row_index", "src_ip", "dst_ip", "dport", "proto",
                 "severity", "is_attack", "attack_type", "confidence",
@@ -635,7 +663,6 @@ def export_csv():
 
 @router.get("/report/txt")
 def export_txt():
-    """Rapport textuel détaillé (pour impression / présentation prof)."""
     with _analysis_lock:
         if not _last_analysis:
             raise HTTPException(status_code=404, detail="Aucune analyse disponible")
@@ -700,12 +727,12 @@ def export_txt():
             dash,
             "  MÉTRIQUES DE PERFORMANCE (vs labels réels)",
             dash,
-            f"  Accuracy  : {m.get('accuracy', 0)*100:.2f}%",
+            f"  Accuracy  : {m.get('accuracy',  0)*100:.2f}%",
             f"  Précision : {m.get('precision', 0)*100:.2f}%",
-            f"  Rappel    : {m.get('recall', 0)*100:.2f}%",
-            f"  F1-Score  : {m.get('f1', 0)*100:.2f}%",
-            f"  FPR       : {m.get('fpr', 0)*100:.2f}%  (faux positifs)",
-            f"  FNR       : {m.get('fnr', 0)*100:.2f}%  (faux négatifs)",
+            f"  Rappel    : {m.get('recall',    0)*100:.2f}%",
+            f"  F1-Score  : {m.get('f1',        0)*100:.2f}%",
+            f"  FPR       : {m.get('fpr',       0)*100:.2f}%  (faux positifs)",
+            f"  FNR       : {m.get('fnr',       0)*100:.2f}%  (faux négatifs)",
             "",
             "  Matrice de confusion :",
             f"    TP={m.get('tp',0)}  FP={m.get('fp',0)}",
@@ -734,7 +761,7 @@ def export_txt():
         sep,
     ]
 
-    content = "\n".join(lines)
+    content  = "\n".join(lines)
     filename = f"nids_rapport_{time.strftime('%Y%m%d_%H%M%S')}.txt"
     return StreamingResponse(
         io.BytesIO(content.encode("utf-8")),
