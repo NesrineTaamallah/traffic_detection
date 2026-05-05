@@ -31,6 +31,9 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from api.analyze import router as analyze_router
+app.include_router(analyze_router)
+
 # ── Imports conditionnels ─────────────────────────────────────────
 MODELS_AVAILABLE  = False
 CAPTURE_AVAILABLE = False
