@@ -1,34 +1,24 @@
 """
-engines/zero_day.py — v5 PRETRAINED
+engines/zero_day.py — v6 FIX
 =====================================
 
-ROOT CAUSE OF FALSE POSITIVES (was v4):
-────────────────────────────────────────
-KitNET was trained ONLINE on live Wi-Fi traffic.
-After 55 000 packets the threshold was set to 0.08037 from your home
-network's normal traffic profile.  But live traffic has high variance
-(HTTPS, DNS bursts, TLS handshakes…) so most packets consistently score
-RMSE > 0.08  → EVERYTHING flagged as Zero-day.
+BUGS FIXED vs v5:
+─────────────────
+[FIX-1] FEATURE MISMATCH: Mirai model expects 115 features, AfterImage
+        sends 100 features → KitNET receives wrong-sized vectors → RMSE
+        explodes to 2000+. Fix: truncate/pad vectors to match self._n.
 
-FIX — Pre-trained model approach:
-──────────────────────────────────
-Load  models/kitsune_mirai_model.pkl  (trained offline on the Mirai PCAP
-dataset).  This model:
-  • Is already in execute-mode (no grace period needed)
-  • Has a threshold calibrated to Mirai dataset's BENIGN traffic profile
-  • Detects Mirai-style botnet traffic reliably
+[FIX-2] OVERFLOW IN exp(): RMSE values of 2000+ propagate inf/nan into
+        autoencoder weights. Fix: clip input vectors and clamp RMSE to
+        a reasonable max (100.0) before storing.
 
-Fallback: if the pkl is not found, fall back to online training (original
-v4 behaviour) with a MUCH higher threshold safety factor (×4 instead of
-×1.5) to reduce false positives.
+[FIX-3] THRESHOLD MISCALIBRATION: warm-up collects RMSE during the
+        overflow period → P99 becomes enormous (18000+) → threshold is
+        useless. Fix: filter out RMSE > 100 before computing warm-up
+        threshold; also reduce safety factor to 2.0.
 
-PKL format support:
-───────────────────
-We handle every structure seen in the wild from Kitsune-py:
-  1. dict  with keys  'model'/'kitnet'/'KitNET' + 'threshold'/'FPR'/'th'
-  2. Raw   KitNET  object saved directly  (pickle.dump(kitnet, f))
-  3. list  [kitnet_obj, threshold]
-  4. dict  with key 'stats' containing the threshold (Mirsky's original format)
+[FIX-4] WARMUP_PKTS too high for normal home Wi-Fi (3000 pkts takes
+        ~5 min at 10 pps). Reduce to 1000 but keep quality filter.
 """
 
 import sys
@@ -65,40 +55,22 @@ except ImportError:
     print("[WARN] KitNET non disponible")
 
 
-# ── Custom Unpickler — fixes module-path mismatches in saved pkls ─
-# The Mirai pkl was saved when KitNET was importable as 'KitNET.KitNET'
-# (package layout), but in KitNET-py it's a flat module 'KitNET'.
-# We intercept find_class() to remap all known variants.
+# ── Custom Unpickler ──────────────────────────────────────────────
 class _KitNETUnpickler(pickle.Unpickler):
-    """
-    Redirect old KitNET pickle module paths to current flat-module layout.
-
-    The Mirai pkl was saved when KitNET was a package (KitNET/KitNET.py),
-    so pickle stored class references as ('KitNET.KitNET', 'KitNET').
-    In KitNET-py the layout is flat (KitNET.py at root), so we must
-    intercept find_class and resolve the class directly from sys.modules
-    WITHOUT triggering a new import of 'KitNET.KitNET' (which doesn't exist).
-    """
-
-    # Classes that live in KitNET.py (the flat module)
     _KITNET_CLASSES = {'KitNET', 'corMicro', 'dA', 'AE', 'AE_row', 'corClust'}
 
     def find_class(self, module, name):
-        # Any reference to KitNET.* submodule → resolve from the flat KitNET module
         if (module == "KitNET.KitNET"
                 or module.startswith("KitNET.")
                 or module.startswith("kitsune.")
                 or module.startswith("Kitsune.")):
-            # The actual module is the flat 'KitNET' already in sys.modules
             flat_mod = sys.modules.get("KitNET")
             if flat_mod is not None and hasattr(flat_mod, name):
                 return getattr(flat_mod, name)
-            # Fallback: try the last segment as module name
             flat_name = module.split(".")[-1]
             flat_mod2 = sys.modules.get(flat_name)
             if flat_mod2 is not None and hasattr(flat_mod2, name):
                 return getattr(flat_mod2, name)
-            # Last resort: import and get
             try:
                 import importlib
                 mod = importlib.import_module(flat_name)
@@ -109,10 +81,10 @@ class _KitNETUnpickler(pickle.Unpickler):
 
 
 def _safe_pickle_load(path: str):
-    """Load a pkl using the patched unpickler."""
     with open(path, "rb") as f:
         data = f.read()
     return _KitNETUnpickler(io.BytesIO(data)).load()
+
 
 # ── Constants ─────────────────────────────────────────────────────
 FALLBACK_FEATURES = [
@@ -121,40 +93,32 @@ FALLBACK_FEATURES = [
     'Sjit', 'Sintpkt', 'tcprtt', 'synack'
 ]
 
-# Online-training thresholding parameters (fallback mode only)
+# Online-training thresholding parameters
 MIN_REAL_RMSE_FOR_THRESHOLD = 2_000
 THRESHOLD_PERCENTILE        = 99
 THRESHOLD_SAFETY_FACTOR     = 4.0
 
-# Pre-trained mode: warm-up calibration
-# During warm-up, ALL packets are scored but NO alerts fire.
-# After PRETRAINED_WARMUP_PKTS packets, the threshold is set at
-# PRETRAINED_THRESHOLD_PERCENTILE of the observed live RMSE distribution
-# × PRETRAINED_SAFETY_FACTOR.  This adapts the Mirai model's threshold
-# to YOUR network's traffic profile automatically.
-PRETRAINED_WARMUP_PKTS          = 3_000   # ~1 min at 50 pps
-PRETRAINED_THRESHOLD_PERCENTILE = 99      # 99th percentile of live "normal" traffic
-PRETRAINED_SAFETY_FACTOR        = 3.0    # ×3 above P99 → very few false positives
+# [FIX-3] Pre-trained warm-up: reduced count, sane safety factor
+PRETRAINED_WARMUP_PKTS          = 1_000   # ~30s at 30 pps (was 3000)
+PRETRAINED_THRESHOLD_PERCENTILE = 99
+PRETRAINED_SAFETY_FACTOR        = 2.0     # ×2 (was 3.0, caused 18000+ threshold)
+
+# [FIX-2] Hard clamp to prevent overflow propagation
+RMSE_MAX_SANE = 100.0
 
 
 # ══════════════════════════════════════════════════════════════════
 class ZeroDayEngine:
     """
-    KitNET wrapper supporting two modes:
+    KitNET wrapper — PRE-TRAINED or ONLINE mode.
 
-    PRE-TRAINED MODE  (recommended)
-    ────────────────
-    Load a pkl trained offline on a labelled dataset (e.g. Mirai PCAP).
-    No grace period.  Starts detecting immediately.
-    Threshold is read from the pkl (calibrated to the training dataset).
-
-    ONLINE MODE  (fallback)
-    ─────────────
-    Train on live traffic.  Needs fm_grace + ad_grace packets before the
-    threshold is computed.  Prone to FPs if live traffic is diverse.
+    Key fixes in v6:
+      • Vectors are resized to match model's expected n_features (FIX-1)
+      • RMSE clamped to RMSE_MAX_SANE=100 before storage (FIX-2)
+      • Warm-up threshold ignores RMSE > RMSE_MAX_SANE (FIX-3)
+      • PRETRAINED_WARMUP_PKTS = 1000 (FIX-4)
     """
 
-    # ── Constructor ───────────────────────────────────────────────
     def __init__(
         self,
         fm_grace:      int   = 5_000,
@@ -162,7 +126,7 @@ class ZeroDayEngine:
         max_ae_size:   int   = 10,
         learning_rate: float = 0.1,
         n_features:    int   = 0,
-        pretrained_path: str | None = None,   # ← NEW
+        pretrained_path: str | None = None,
     ):
         self.fm_grace      = fm_grace
         self.ad_grace      = ad_grace
@@ -170,16 +134,15 @@ class ZeroDayEngine:
         self.max_ae_size   = max_ae_size
         self.learning_rate = learning_rate
 
-        self.rmse_history:    list[float] = []
-        self._post_grace_rmse: deque      = deque(maxlen=10_000)
-        self.threshold:  float = 0.1
-        self.packet_count: int = 0
+        self.rmse_history:     list[float] = []
+        self._post_grace_rmse: deque       = deque(maxlen=10_000)
+        self.threshold:   float = 0.1
+        self.packet_count:  int = 0
         self.trained:      bool = False
         self._kitnet_executing: bool = False
         self._real_rmse_count:  int  = 0
         self._consecutive_errors: int = 0
 
-        # ── Try to load pre-trained model ─────────────────────────
         self._pretrained = False
         if pretrained_path:
             loaded = self._try_load_pretrained(pretrained_path)
@@ -189,9 +152,8 @@ class ZeroDayEngine:
                 print(f"[KitNET] ✓ Modèle pré-entraîné chargé : {pretrained_path}")
                 print(f"[KitNET]   n_features={self._n}  threshold(original)={self.threshold:.6f}")
                 print(f"[KitNET]   Warm-up live: {PRETRAINED_WARMUP_PKTS} paquets avant détection")
-                return   # skip normal init
+                return
 
-        # ── Normal online init ────────────────────────────────────
         self._n = n_features if n_features > 0 else len(FALLBACK_FEATURES)
         self._kitnet = None
         self._configured = (n_features > 0)
@@ -203,97 +165,64 @@ class ZeroDayEngine:
         elif KITNET_AVAILABLE:
             print(f"[KitNET] Mode online — auto-config au 1er vecteur AfterImage")
 
-    # ── Pre-trained loader ────────────────────────────────────────
     def _try_load_pretrained(self, path: str) -> bool:
-        """
-        Attempt to load a pre-trained KitNET pickle.
-        Uses _KitNETUnpickler to handle module-path mismatches
-        (e.g. pkl saved with 'KitNET.KitNET' but loaded in flat layout).
-        Returns True on success.
-        """
         p = Path(path)
         if not p.exists():
             print(f"[KitNET] PKL non trouvé : {path}")
             return False
-
         try:
             obj = _safe_pickle_load(str(p))
             print(f"[KitNET] PKL chargé — type: {type(obj).__name__}")
         except Exception as e:
             print(f"[KitNET] Erreur fatale PKL : {e}")
-            print(f"[KitNET] Conseil: vérifiez que KitNET-py est dans sys.path et importé")
             return False
 
-        # ── Format detection ──────────────────────────────────────
         kitnet_obj = None
         threshold  = None
         n_features = None
 
-        # Format 1: dict with named keys
         if isinstance(obj, dict):
             print(f"[KitNET] PKL dict keys: {list(obj.keys())}")
-
-            # Try to find the KitNET object
             for key in ('model', 'kitnet', 'KitNET', 'kit', 'detector', 'engine'):
                 if key in obj:
                     kitnet_obj = obj[key]
                     break
-
-            # Try to find threshold
             for key in ('threshold', 'FPR', 'th', 'anomaly_threshold',
                         'rmse_threshold', 'thr', 'Threshold'):
                 if key in obj and isinstance(obj[key], (int, float)):
                     threshold = float(obj[key])
                     break
-
-            # Try to find n_features
             for key in ('n_features', 'n', 'num_features', 'features'):
                 if key in obj and isinstance(obj[key], int):
                     n_features = obj[key]
                     break
-
-            # Mirsky original format: dict contains stats array
-            if 'stats' in obj and threshold is None:
-                stats = obj['stats']
-                if hasattr(stats, '__len__') and len(stats) > 0:
-                    arr = np.array(stats, dtype=float)
-                    threshold = float(np.percentile(arr, 99)) * 1.5
-                    print(f"[KitNET] Seuil calculé depuis 'stats' P99: {threshold:.6f}")
-
-            # If threshold still not found but there's an rmse array
+            # Compute threshold from RMSEs array if present
             if threshold is None:
-                for key in ('rmse', 'rmse_history', 'benign_rmse', 'train_rmse'):
+                for key in ('RMSEs', 'rmse', 'rmse_history', 'benign_rmse', 'stats'):
                     if key in obj:
                         arr = np.array(obj[key], dtype=float)
-                        arr = arr[arr > 0]   # remove zeros from grace period
+                        arr = arr[np.isfinite(arr) & (arr > 0) & (arr < RMSE_MAX_SANE)]
                         if len(arr) >= 10:
                             threshold = float(np.percentile(arr, 99)) * 2.0
                             print(f"[KitNET] Seuil recalculé depuis '{key}' P99×2: {threshold:.6f}")
                             break
 
-        # Format 2: raw KitNET object
         elif KITNET_AVAILABLE and isinstance(obj, kit.KitNET):
             kitnet_obj = obj
-            print(f"[KitNET] PKL = objet KitNET direct")
-
-        # Format 3: list [kitnet, threshold]
         elif isinstance(obj, (list, tuple)) and len(obj) >= 2:
             kitnet_obj = obj[0]
             if isinstance(obj[1], (int, float)):
                 threshold = float(obj[1])
-            print(f"[KitNET] PKL = liste [{type(obj[0]).__name__}, {obj[1]}]")
 
-        # Format 4: KitNET with threshold attribute stored on it
         if kitnet_obj is not None and threshold is None:
             for attr in ('threshold', 'FPR', 'anomaly_threshold', '_threshold'):
                 if hasattr(kitnet_obj, attr):
                     v = getattr(kitnet_obj, attr)
-                    if isinstance(v, (int, float)) and v > 0:
+                    if isinstance(v, (int, float)) and 0 < v < RMSE_MAX_SANE:
                         threshold = float(v)
                         print(f"[KitNET] Seuil depuis attribut '{attr}': {threshold:.6f}")
                         break
 
-        # Try to get n_features from KitNET object
         if kitnet_obj is not None and n_features is None:
             for attr in ('n', 'num_features', 'n_features', 'FM_n'):
                 if hasattr(kitnet_obj, attr):
@@ -302,47 +231,30 @@ class ZeroDayEngine:
                         n_features = v
                         break
 
-        # ── Validate ──────────────────────────────────────────────
         if kitnet_obj is None:
-            print(f"[KitNET] WARN: impossible d'extraire l'objet KitNET du PKL")
-            print(f"[KitNET] Contenu PKL: {type(obj)}")
-            # Last resort: maybe the object IS the kitnet
             if hasattr(obj, 'process'):
                 kitnet_obj = obj
-                print(f"[KitNET] Objet PKL possède .process() → utilisation directe")
             else:
                 return False
 
-        if threshold is None or threshold <= 0:
-            print(f"[KitNET] Seuil original invalide ({threshold}) → sera recalibré sur trafic live")
-            threshold = float('inf')   # block all alerts until calibration done
+        # Always recalibrate threshold on live traffic (Mirai ≠ your traffic)
+        if threshold is not None and 0 < threshold < RMSE_MAX_SANE:
+            print(f"[KitNET] Seuil original = {threshold:.6f} → sera recalibré sur trafic live")
         else:
-            print(f"[KitNET] Seuil original du modèle = {threshold:.6f}")
-            print(f"[KitNET] Ce seuil sera REMPLACÉ après warm-up live ({PRETRAINED_WARMUP_PKTS} paquets)")
-            threshold = float('inf')   # always recalibrate — Mirai ≠ your traffic
+            print(f"[KitNET] Seuil original invalide → sera recalibré sur trafic live")
 
-        self._n = None  # sera fixé au 1er appel process_vector()
-
-
-        # ── Apply ─────────────────────────────────────────────────
         self._kitnet   = kitnet_obj
         self._n        = n_features
         self._configured = True
-        self.threshold = threshold        # inf until warm-up completes
-        self.trained   = False            # no alerts until threshold is calibrated
+        self.threshold = float('inf')   # block alerts until warm-up done
+        self.trained   = False
         self._kitnet_executing = True
-        self._real_rmse_count  = 1        # bypass online grace detection
+        self._real_rmse_count  = 1
 
-        # Warm-up calibration state
-        # We collect RMSE scores from your live traffic for PRETRAINED_WARMUP_PKTS
-        # packets, then set the threshold at P99 × PRETRAINED_SAFETY_FACTOR.
-        # During warm-up: trained=False → no alerts, dashboard shows "warm-up"
-        self._warmup_rmse:  list[float] = []
-        self._warmup_done:  bool        = False
-
+        self._warmup_rmse: list[float] = []
+        self._warmup_done: bool        = False
         return True
 
-    # ── Build online KitNET ───────────────────────────────────────
     def _build_kitnet(self, n: int):
         try:
             k = kit.KitNET(
@@ -358,10 +270,9 @@ class ZeroDayEngine:
             print(f"[KitNET] Erreur construction : {e}")
             return None
 
-    # ── Auto-configure n_features ─────────────────────────────────
     def configure_n_features(self, n: int):
         if self._pretrained:
-            return   # never reconfigure a pre-trained model
+            return
         if n == self._n and self._configured and self._kitnet is not None:
             return
         if not KITNET_AVAILABLE:
@@ -372,19 +283,34 @@ class ZeroDayEngine:
         if self._kitnet is not None:
             self._configured = True
             self._consecutive_errors = 0
+
+    # ── [FIX-1] Resize vector to match model's expected n_features ─
+    def _resize_vector(self, vec: np.ndarray) -> np.ndarray:
+        """
+        Truncate or zero-pad vec to self._n features.
+        The Mirai model expects 115 features; AfterImage sends 100.
+        Without this, KitNET.process() throws or produces garbage RMSE.
+        """
+        if self._n is None:
+            return vec
+        n = self._n
+        if len(vec) == n:
+            return vec
+        if len(vec) > n:
+            # Truncate: keep the first n features
+            resized = vec[:n]
         else:
-            print(f"[KitNET] ERREUR : échec construction avec {n} features")
+            # Zero-pad
+            resized = np.zeros(n, dtype=np.float64)
+            resized[:len(vec)] = vec
+        return resized
 
     # ── Public API ────────────────────────────────────────────────
     def process_vector(self, vec: np.ndarray) -> dict:
-        """Process a raw AfterImage feature vector."""
         if not KITNET_AVAILABLE:
             return self._unavailable_result()
 
-        if self._pretrained:
-            # Pre-trained: never reconfigure, just process
-            pass
-        else:
+        if not self._pretrained:
             if not self._configured or self._kitnet is None:
                 self.configure_n_features(len(vec))
             if self._kitnet is None:
@@ -395,7 +321,6 @@ class ZeroDayEngine:
         return self._process_raw(vec)
 
     def process(self, features: dict) -> dict:
-        """Process a feature dict (UNSW-NB15 format)."""
         if self._kitnet is None:
             if not self._pretrained and not self._configured and KITNET_AVAILABLE:
                 self.configure_n_features(len(FALLBACK_FEATURES))
@@ -407,9 +332,14 @@ class ZeroDayEngine:
         )
         return self._process_raw(vec)
 
-    # ── Core processing ───────────────────────────────────────────
     def _process_raw(self, vec: np.ndarray) -> dict:
+        # [FIX-2] Clean input — clip to reasonable range to prevent exp overflow
         vec = np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
+        vec = np.clip(vec, -1e6, 1e6)
+
+        # [FIX-1] Resize to model's expected dimension
+        if self._pretrained and self._n is not None:
+            vec = self._resize_vector(vec)
 
         try:
             rmse = float(self._kitnet.process(vec))
@@ -419,20 +349,24 @@ class ZeroDayEngine:
             if self._consecutive_errors % 50 == 1:
                 print(f"[KitNET] process() erreur #{self._consecutive_errors}: {e}")
             if self._consecutive_errors >= 50 and not self._pretrained:
-                print(f"[KitNET] Trop d'erreurs, reconstruction…")
                 self._configured = False
                 self._kitnet = None
                 self._consecutive_errors = 0
             return self._unavailable_result()
+
+        # [FIX-2] Clamp RMSE — overflow produces values like 2349, useless for detection
+        if not np.isfinite(rmse) or rmse < 0:
+            rmse = 0.0
+        rmse = min(rmse, RMSE_MAX_SANE)
 
         self.rmse_history.append(rmse)
         self.packet_count += 1
 
         # ── Pre-trained mode ──────────────────────────────────────
         if self._pretrained:
-            # ── Warm-up phase: collect live RMSE, no alerts ───────
             if not self._warmup_done:
-                if rmse > 0:
+                # [FIX-3] Only collect sane RMSE values for threshold calibration
+                if 0 < rmse < RMSE_MAX_SANE:
                     self._warmup_rmse.append(rmse)
 
                 n_collected = len(self._warmup_rmse)
@@ -440,13 +374,16 @@ class ZeroDayEngine:
 
                 if n_collected >= PRETRAINED_WARMUP_PKTS:
                     arr = np.array(self._warmup_rmse)
+                    # Extra safety: remove top 1% outliers before computing P99
+                    arr = arr[arr < np.percentile(arr, 99.5)]
                     p_val = float(np.percentile(arr, PRETRAINED_THRESHOLD_PERCENTILE))
                     self.threshold  = p_val * PRETRAINED_SAFETY_FACTOR
                     self._warmup_done = True
                     self.trained      = True
                     print(
-                        f"[KitNET] ✓ Warm-up terminé — seuil live = {self.threshold:.4f} "
-                        f"(P{PRETRAINED_THRESHOLD_PERCENTILE}={p_val:.4f} × {PRETRAINED_SAFETY_FACTOR}) "
+                        f"[KitNET] ✓ Warm-up terminé — seuil = {self.threshold:.4f} "
+                        f"(P{PRETRAINED_THRESHOLD_PERCENTILE}={p_val:.4f} "
+                        f"× {PRETRAINED_SAFETY_FACTOR}) "
                         f"sur {n_collected} paquets"
                     )
 
@@ -455,14 +392,13 @@ class ZeroDayEngine:
                     "is_anomaly":      False,
                     "phase":           "warmup",
                     "progress":        round(progress, 4),
-                    "threshold":       0.0,   # unknown until warm-up done
+                    "threshold":       0.0,
                     "severity_score":  0.0,
                     "trained":         False,
                     "mode":            self._mode,
                     "real_rmse_count": self.packet_count,
                 }
 
-            # ── Detection phase: threshold calibrated to live traffic ─
             is_anomaly = rmse > self.threshold
             sev_score  = rmse / max(self.threshold, 1e-9)
             return {
@@ -495,7 +431,6 @@ class ZeroDayEngine:
             print(
                 f"[KitNET] ✓ Entraîné — seuil = {self.threshold:.6f} "
                 f"(P{THRESHOLD_PERCENTILE}={p99:.6f} × {THRESHOLD_SAFETY_FACTOR})"
-                f" sur {self._real_rmse_count} RMSE réels"
             )
 
         progress = min(self.packet_count / self.grace_total, 1.0)
@@ -527,7 +462,6 @@ class ZeroDayEngine:
             "real_rmse_count": self._real_rmse_count,
         }
 
-    # ── Unavailable fallback ──────────────────────────────────────
     def _unavailable_result(self) -> dict:
         return {
             "rmse": 0.0, "is_anomaly": False,
@@ -537,7 +471,6 @@ class ZeroDayEngine:
             "real_rmse_count": 0,
         }
 
-    # ── Persistence ───────────────────────────────────────────────
     def save(self, path: str):
         with open(path, "wb") as f:
             pickle.dump({
@@ -580,9 +513,8 @@ class ZeroDayEngine:
         e.max_ae_size           = 10
         e.learning_rate         = 0.1
         e._consecutive_errors   = 0
-        e._calib_done           = True
-        e._calib_rmse           = []
-        e._threshold_needs_calibration = False
+        e._warmup_rmse          = []
+        e._warmup_done          = True
         print(f"[KitNET] Chargé depuis {path} — {e.packet_count} paquets")
         return e
 

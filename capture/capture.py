@@ -1,17 +1,12 @@
 """
-capture/capture.py — CORRIGÉ v3
+capture/capture.py — CORRIGÉ v4
 ======================================================
-FIXES :
-[FIX-1] Interface Windows : lecture des noms lisibles via tshark/winreg
-         pour mapper GUID → nom humain (Wi-Fi, Ethernet, etc.)
-[FIX-2] _flow_key() : délai pyshark → accès aux couches via indexation
-         sécurisée + support ICMP/ARP + log des paquets ignorés
-[FIX-3] FLOW_TIMEOUT réduit à 5 s (30 s = flux jamais émis en démo)
-         MAX_FLOW_PKTS réduit à 50 pour émettre plus vite
-[FIX-4] Émission forcée des flux actifs toutes les 3 s (flush périodique)
-         pour que XGBoost reçoive du trafic dès le début
-[FIX-5] Log détaillé : paquets reçus, flux émis, vecteurs AfterImage
-[FIX-6] configure_n_features() : suppression du guard packet_count > 0
+FIXES v4 (en plus des fixes v3):
+[FIX-7] to_unsw_features() : expose _fin_seen, _syn_seen, _ack_seen,
+        _rst_seen dans le dict de features → utilisé par _infer_state_from_flow()
+        dans known_attack.py pour le one-hot encoding state_XXX.
+[FIX-8] Suppression des warnings FutureWarning numpy : np.object, np.str
+        remplacés par les alias sûrs (object, str).
 """
 import numpy as np
  
@@ -30,10 +25,8 @@ if not hasattr(np, 'float'):
     np.float = float
 if not hasattr(np, 'complex'):
     np.complex = complex
-if not hasattr(np, 'object'):
-    np.object = object
-if not hasattr(np, 'str'):
-    np.str = str
+# [FIX-8] Ne pas réinjecter np.object et np.str — ils causent FutureWarning
+# et ne sont pas nécessaires pour notre code
  
 print("[PATCH] numpy_compat_patch appliqué — np.Inf, np.NaN réinjectés")
  
@@ -42,7 +35,6 @@ import sys
 import time
 import threading
 import asyncio
-import subprocess
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -86,16 +78,12 @@ except ImportError:
     print("[WARN] pyshark manquant — pip install pyshark")
 
 
-# ── [FIX-1] Résolution GUID → nom lisible (Windows) ───────────────
 def _guid_to_friendly_name(guid: str) -> str:
-    """Tente de résoudre un GUID d'interface Windows en nom lisible."""
     if sys.platform != "win32":
         return guid
     try:
         import winreg
         base = r"SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}"
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base)
-        # Extraire le GUID pur depuis \Device\NPF_{GUID}
         pure = guid.replace("\\Device\\NPF_", "").strip("{}")
         sub_path = f"{base}\\{{{pure}}}\\Connection"
         try:
@@ -109,7 +97,6 @@ def _guid_to_friendly_name(guid: str) -> str:
 
 
 def _list_interfaces_with_names() -> list[tuple[str, str]]:
-    """Retourne [(guid, friendly_name), ...] pour toutes les interfaces pyshark."""
     if not PYSHARK_AVAILABLE:
         return []
     try:
@@ -126,10 +113,6 @@ def _list_interfaces_with_names() -> list[tuple[str, str]]:
 
 
 def _detect_interface() -> str:
-    """
-    Retourne l'interface réseau à utiliser.
-    Priorité : NIDS_INTERFACE > Wi-Fi > Ethernet > première non-loopback
-    """
     env_iface = os.environ.get("NIDS_INTERFACE", "").strip()
     if env_iface:
         print(f"[CAPTURE] Interface depuis NIDS_INTERFACE : '{env_iface}'")
@@ -147,7 +130,6 @@ def _detect_interface() -> str:
         print(f"          {name!r:30s} → {guid}")
     print(f"[CAPTURE] Pour forcer : set NIDS_INTERFACE=<guid ou nom>")
 
-    # Préférence par nom lisible
     preferred_keywords = ["wi-fi", "wifi", "wireless", "wlan", "ethernet", "lan", "local"]
     skip_keywords = ["loopback", "usbpcap", "etwdump", "bluetooth", "npcap loopback"]
 
@@ -169,7 +151,6 @@ def _detect_interface() -> str:
         print(f"[CAPTURE] Interface choisie : {chosen_name!r} ({chosen_guid})")
         return chosen_guid
 
-    # Fallback : première interface non-loopback
     for guid, name in pairs:
         if "loopback" not in name.lower() and "etwdump" not in name.lower():
             return guid
@@ -202,10 +183,13 @@ class FlowRecord:
     dpkts:       int   = 0
     sttl:        int   = 64
     dttl:        int   = 0
+    # [FIX-7] Exposer les flags TCP pour l'inférence du 'state'
     syn_seen:    bool  = False
     synack_time: float = 0.0
     ack_time:    float = 0.0
     fin_seen:    bool  = False
+    rst_seen:    bool  = False
+    ack_seen:    bool  = False
     last_seen:   float = field(default_factory=time.time)
 
     def to_unsw_features(self) -> dict:
@@ -238,14 +222,15 @@ class FlowRecord:
             '_src_ip': self.src_ip, '_dst_ip': self.dst_ip,
             '_sport': self.sport,   '_dport': self.dport,
             '_proto': self.proto,
+            # [FIX-7] TCP state flags pour _infer_state_from_flow()
+            '_syn_seen': self.syn_seen,
+            '_ack_seen': self.ack_seen,
+            '_fin_seen': self.fin_seen,
+            '_rst_seen': self.rst_seen,
         }
 
 
 class AfterImageExtractor:
-    """
-    Wrapper netStat de Kitsune-py.
-    updateGetStats = API camelCase réelle.
-    """
     def __init__(self):
         self._nstat = None
         self._n_features = 100
@@ -273,7 +258,6 @@ class AfterImageExtractor:
             srcIP = dstIP = srcMAC = dstMAC = ''
             srcproto = dstproto = ''
 
-            # Couche IP / IPv6
             try:
                 ip = pkt['ip']
                 srcIP, dstIP = ip.src, ip.dst
@@ -286,7 +270,6 @@ class AfterImageExtractor:
                 except Exception:
                     pass
 
-            # Transport
             try:
                 tcp = pkt['tcp']
                 srcproto = str(tcp.srcport)
@@ -314,7 +297,6 @@ class AfterImageExtractor:
                         except Exception:
                             pass
 
-            # Ethernet
             try:
                 eth = pkt['eth']
                 srcMAC = eth.src
@@ -341,13 +323,6 @@ class AfterImageExtractor:
 
 
 class NetworkCapture:
-    """
-    Capture réseau double pipeline.
-    [FIX-3] FLOW_TIMEOUT = 5s, MAX_FLOW_PKTS = 50
-    [FIX-4] Flush périodique toutes les 3s
-    [FIX-5] Logs détaillés de diagnostic
-    """
-    # [FIX-3] Valeurs réduites pour émission rapide
     FLOW_TIMEOUT  = 5.0
     MAX_FLOW_PKTS = 50
 
@@ -381,30 +356,21 @@ class NetworkCapture:
         self._total_pkts  = 0
         self._total_flows = 0
 
-        # Compteurs de diagnostic
         self._pkts_with_ip   = 0
         self._pkts_no_layer  = 0
         self._vecs_sent      = 0
         self._last_log_time  = time.time()
 
-    # ── [FIX-2] Flow key robuste ──────────────────────────────────
     def _flow_key(self, pkt) -> Optional[tuple]:
-        """
-        Extrait la clé de flux. Utilise l'indexation par string
-        au lieu de hasattr() pour éviter les faux négatifs pyshark.
-        """
         try:
-            # Tenter d'accéder à la couche IP via indexation (plus fiable)
             try:
                 ip = pkt['ip']
                 src = ip.src
                 dst = ip.dst
             except Exception:
-                # Pas de couche IP — ignorer silencieusement
                 self._pkts_no_layer += 1
                 return None
 
-            # Transport
             proto = "OTHER"
             sp = dp = 0
             try:
@@ -457,13 +423,19 @@ class NetworkCapture:
                 pass
             try:
                 flags = int(pkt['tcp'].flags, 16)
-                if flags & 0x02: flow.syn_seen = True
+                if flags & 0x02:
+                    flow.syn_seen = True
+                if flags & 0x10:
+                    flow.ack_seen = True
                 if flags & 0x12 and flow.syn_seen and not flow.synack_time:
                     flow.synack_time = now
                 if flags & 0x10 and flow.synack_time and not flow.ack_time:
                     flow.ack_time = now
-                # FIN ou RST → émettre le flux
-                if flags & 0x01 or flags & 0x04:
+                if flags & 0x04:   # RST
+                    flow.rst_seen = True
+                    emit = True
+                if flags & 0x01:   # FIN
+                    flow.fin_seen = True
                     emit = True
             except Exception:
                 pass
@@ -483,18 +455,12 @@ class NetworkCapture:
                 print(f"[FLOW CB] {e}")
 
     def _timeout_checker(self):
-        """
-        [FIX-4] Flush toutes les 3s (au lieu de 5s) + flush forcé
-        des flux actifs même non expirés si > 2 paquets
-        """
         while self._running:
             now = time.time()
 
             with self._flows_lock:
-                # Flux expirés
                 expired = [k for k, v in list(self._flows.items())
                            if now - v.last_seen > self.FLOW_TIMEOUT]
-                # [FIX-4] Flush forcé des flux avec assez de paquets
                 forced = [k for k, v in list(self._flows.items())
                           if k not in expired and len(v.packets) >= 3
                           and now - v.last_seen > 1.0]
@@ -502,7 +468,6 @@ class NetworkCapture:
             for k in expired + forced:
                 self._emit_flow(k)
 
-            # [FIX-5] Log de diagnostic toutes les 10s
             if now - self._last_log_time > 10.0:
                 self._last_log_time = now
                 with self._flows_lock:
@@ -521,7 +486,6 @@ class NetworkCapture:
         if not PYSHARK_AVAILABLE:
             raise RuntimeError("pyshark non installé — pip install pyshark")
 
-        # [FIX-5] Boucle asyncio propre pour Windows
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
@@ -557,7 +521,6 @@ class NetworkCapture:
                     cutoff = now - 1.0
                     self._pps_window = [t for t in self._pps_window if t >= cutoff]
 
-                # Pipeline A : AfterImage → KitNET
                 vec = self._afterimage.extract(pkt)
                 if vec is not None:
                     self._vecs_sent += 1
@@ -566,7 +529,6 @@ class NetworkCapture:
                     except Exception as e:
                         print(f"[VEC CB] {e}")
 
-                # Pipeline B : flux UNSW → XGBoost
                 key = self._flow_key(pkt)
                 if key:
                     self._update_flow(key, pkt)
